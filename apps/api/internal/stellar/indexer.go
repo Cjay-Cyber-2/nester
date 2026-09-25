@@ -69,6 +69,10 @@ type IndexerOptions struct {
 	// the indexer behaves exactly as before: telemetry must never be able to
 	// stop the indexer from indexing.
 	Recorder FreshnessRecorder
+
+	// DepositObserver, if set, is notified after a deposit event's
+	// transaction commits. See EventPoller.DepositObserver.
+	DepositObserver DepositObserver
 }
 
 // StartEventIndexer launches the long-running event indexer.
@@ -89,10 +93,11 @@ func StartEventIndexer(ctx context.Context, logger *slog.Logger, db *sql.DB, sys
 	// the atomic cursor/balance commit — lives in EventPoller, which is the
 	// unit the deterministic replay harness exercises (issue #1051).
 	poller := &EventPoller{
-		DB:      db,
-		SysRepo: sysRepo,
-		Fetcher: NewRPCEventFetcherWithOptions(httpClient, opts.RPCURL, opts.RPCOptions),
-		Logger:  logger,
+		DB:              db,
+		SysRepo:         sysRepo,
+		Fetcher:         NewRPCEventFetcherWithOptions(httpClient, opts.RPCURL, opts.RPCOptions),
+		Logger:          logger,
+		DepositObserver: opts.DepositObserver,
 	}
 
 	go func() {
@@ -205,6 +210,19 @@ type indexedEvent struct {
 	// made through the API and later observed on-chain is credited exactly
 	// once (nester#1147). Empty for events from an RPC that did not report it.
 	TxHash string
+	// LedgerClosedAt is when the ledger that emitted this event actually
+	// closed on-chain, as reported by the RPC. Zero when the RPC response
+	// omitted it; callers that need a timestamp should fall back to their own
+	// observation time in that case rather than treat zero as real.
+	LedgerClosedAt time.Time
+}
+
+// normalizeEventTypeString lower-cases and trims an event type the same way
+// applyEventMutation's switch does. Factored out so callers outside that
+// switch (the deposit observer) can agree with it on what an event type is
+// without duplicating the exact transform.
+func normalizeEventTypeString(eventType string) string {
+	return strings.ToLower(strings.TrimSpace(eventType))
 }
 
 // applyIndexedEvent applies one event in its own transaction, without
@@ -248,7 +266,7 @@ func applyIndexedEvent(ctx context.Context, db *sql.DB, event indexedEvent) (boo
 // this switch would let the two paths drift, and the replay harness would then
 // be proving the wrong one correct.
 func applyEventMutation(ctx context.Context, tx *sql.Tx, event indexedEvent) error {
-	switch strings.ToLower(strings.TrimSpace(event.EventType)) {
+	switch normalizeEventTypeString(event.EventType) {
 	case "pause":
 		_, err := tx.ExecContext(
 			ctx,
@@ -740,12 +758,13 @@ func fetchSorobanEvents(
 		Result struct {
 			LatestLedger uint64 `json:"latestLedger"`
 			Events       []struct {
-				ID         string         `json:"id"`
-				ContractID string         `json:"contractId"`
-				Ledger     uint64         `json:"ledger"`
-				TxHash     string         `json:"txHash"`
-				Topic      []interface{}  `json:"topic"`
-				Value      map[string]any `json:"value"`
+				ID             string         `json:"id"`
+				ContractID     string         `json:"contractId"`
+				Ledger         uint64         `json:"ledger"`
+				TxHash         string         `json:"txHash"`
+				Topic          []interface{}  `json:"topic"`
+				Value          map[string]any `json:"value"`
+				LedgerClosedAt string         `json:"ledgerClosedAt"`
 			} `json:"events"`
 		} `json:"result"`
 		Error *struct {
@@ -771,13 +790,20 @@ func fetchSorobanEvents(
 		if eventType == "" {
 			continue
 		}
+		var closedAt time.Time
+		if raw.LedgerClosedAt != "" {
+			if parsed, err := time.Parse(time.RFC3339, raw.LedgerClosedAt); err == nil {
+				closedAt = parsed
+			}
+		}
 		events = append(events, indexedEvent{
-			ID:         raw.ID,
-			ContractID: raw.ContractID,
-			EventType:  eventType,
-			Ledger:     raw.Ledger,
-			Data:       raw.Value,
-			TxHash:     raw.TxHash,
+			ID:             raw.ID,
+			ContractID:     raw.ContractID,
+			EventType:      eventType,
+			Ledger:         raw.Ledger,
+			Data:           raw.Value,
+			TxHash:         raw.TxHash,
+			LedgerClosedAt: closedAt,
 		})
 	}
 
@@ -844,6 +870,10 @@ type EventSyncer struct {
 	// RPCOptions carries the shared retry policy. Zero means package
 	// defaults, which is what an EventSyncer built outside startup gets.
 	RPCOptions RPCOptions
+
+	// DepositObserver, if set, is notified after a deposit event's
+	// transaction commits. See EventPoller.DepositObserver.
+	DepositObserver DepositObserver
 }
 
 func (s *EventSyncer) SyncEvents(ctx context.Context) (int, error) {
@@ -875,6 +905,7 @@ func (s *EventSyncer) SyncEvents(ctx context.Context) (int, error) {
 		}
 		if ok {
 			processed++
+			notifyDepositObserver(ctx, s.DB, s.Logger, s.DepositObserver, event)
 		}
 	}
 
