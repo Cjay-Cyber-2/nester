@@ -1,6 +1,5 @@
 #![no_std]
 
-pub mod accrual;
 mod basket;
 mod breaker;
 pub mod conversion;
@@ -121,9 +120,9 @@ const REBALANCE: Symbol = symbol_short!("REBAL");
 /// Emitted when a rebalance skips a source because its adapter failed.
 const SOURCE_SKIPPED: Symbol = symbol_short!("SRC_SKIP");
 const HARVEST: Symbol = symbol_short!("HARVEST");
-/// Time-weighted yield accumulator events (issue #803).
-const YIELD_IDX_UPD: Symbol = symbol_short!("YLD_IDX");
-const USER_YIELD_ACCRUED: Symbol = symbol_short!("USR_ACCR");
+/// Time-vested yield report events (issue #803).
+const YIELD_STREAM_STARTED: Symbol = symbol_short!("YLD_STRT");
+const YIELD_RELEASED: Symbol = symbol_short!("YLD_RLSD");
 const MIN_REBALANCE_AMOUNT: i128 = 1;
 const DEFAULT_REBALANCE_COOLDOWN: u64 = 3600;
 /// Default rebalance slippage tolerance: 50 bps (0.5%) — issue #638.
@@ -211,18 +210,21 @@ pub struct TimestampEventData {
 
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct YieldIndexUpdatedEventData {
-    pub old_index: i128,
-    pub new_index: i128,
-    pub amount: i128,
+pub struct YieldStreamStartedEventData {
+    /// Total amount now vesting over the stream's window (the new report's
+    /// amount plus any not-yet-vested remainder folded in from a prior
+    /// still-active stream — see `start_or_extend_yield_stream`).
+    pub total: i128,
+    pub started_at: u64,
+    pub ends_at: u64,
 }
 
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct UserYieldAccruedEventData {
-    pub user: Address,
-    pub accrued: i128,
-    pub user_index: i128,
+pub struct YieldReleasedEventData {
+    /// Amount moved from the vesting stream into `TotalAssets` this call.
+    pub released: i128,
+    pub remaining: i128,
 }
 
 #[contracttype]
@@ -424,9 +426,13 @@ enum DataKey {
     MaxPriceDeviationBps, // u32 maximum price deviation
     // --- Referral integration (issue #818) ---
     ReferralContract,
-    // --- Time-weighted yield accumulator (issue #803) ---
-    YieldIndex,
-    UserYieldCheckpoint(Address),
+    // --- Time-vested yield reports (issue #803) ---
+    /// The active (or most recently active) yield vesting stream. Absent
+    /// means no stream has ever started.
+    YieldVestingStream,
+    /// Vesting window duration in seconds, admin-configurable. Absent
+    /// defaults to [`DEFAULT_YIELD_VESTING_SECONDS`].
+    YieldVestingPeriodSeconds,
 }
 
 /// Why a penalty was charged (issue #805). `LockBreak` and `WeightDeviation`
@@ -1284,105 +1290,196 @@ fn set_user_yield(env: &Env, user: &Address, amount: i128) {
 }
 
 // ---------------------------------------------------------------------------
-// Time-weighted yield accumulator (issue #803)
+// Time-vested yield reports (issue #803)
 //
-// This is an additive accounting/attribution layer only: it tracks, per
-// user, how much of the vault's reported yield they are entitled to based on
-// how long they held shares relative to the global index — the standard
-// sniping-resistant "MasterChef"-style pattern (see `accrual` module docs
-// for the full accounting model). It does NOT change what `harvest` or
-// `withdraw` actually pay out; those remain on the existing
-// principal/redeemable-value accounting. `pending_yield_for` exposes this
-// layer's own view for callers who want the sniping-resistant figure
-// specifically.
+// A reported yield amount is no longer applied to TotalAssets instantly.
+// Instead it vests linearly into TotalAssets over YieldVestingPeriodSeconds,
+// closing the sniping hole: a deposit made immediately before report_yield
+// only captures the sliver of the report that vests during however long the
+// attacker actually holds shares afterward, not the whole amount. A holder
+// who was already present before the report captures proportionally more,
+// simply by virtue of the report continuing to vest while they hold shares
+// and the attacker (if they withdraw quickly) does not.
+//
+// This intentionally keeps yield inside share price (this vault's existing,
+// deeply-entangled model — fee tiers, the emergency-withdrawal preview, and
+// the referral hook all read `redeemable = amount_for_shares(shares)` as the
+// yield signal); vesting is exactly the mechanism the issue itself names as
+// an acceptable alternative to a full accumulator migration when the two are
+// in tension, and is far smaller surgery on a 4000+ line vault contract.
 // ---------------------------------------------------------------------------
 
-fn get_yield_index(env: &Env) -> i128 {
+/// Default vesting window: how long a single `report_yield` call's amount
+/// takes to fully land in `TotalAssets`. 1 day - long enough that a
+/// snipe-and-immediately-withdraw captures only a small fraction of a
+/// report, short enough that legitimate holders are not kept waiting an
+/// unreasonable time for genuinely-earned yield to become spendable.
+/// Admin-adjustable between 1 hour and 30 days via `set_yield_vesting_period`.
+pub const DEFAULT_YIELD_VESTING_SECONDS: u64 = 24 * 60 * 60;
+pub const MIN_YIELD_VESTING_SECONDS: u64 = 60 * 60;
+pub const MAX_YIELD_VESTING_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct YieldVestingStream {
+    /// Total amount this stream will release by `ends_at`.
+    pub total: i128,
+    /// Amount already released into `TotalAssets` so far.
+    pub released: i128,
+    pub started_at: u64,
+    pub ends_at: u64,
+}
+
+fn get_yield_vesting_period(env: &Env) -> u64 {
     env.storage()
         .instance()
-        .get(&DataKey::YieldIndex)
-        .unwrap_or(accrual::SCALE)
+        .get(&DataKey::YieldVestingPeriodSeconds)
+        .unwrap_or(DEFAULT_YIELD_VESTING_SECONDS)
 }
 
-fn set_yield_index(env: &Env, index: i128) {
-    env.storage().instance().set(&DataKey::YieldIndex, &index);
+fn get_yield_stream(env: &Env) -> Option<YieldVestingStream> {
+    env.storage().instance().get(&DataKey::YieldVestingStream)
 }
 
-fn get_user_yield_checkpoint(env: &Env, user: &Address) -> Option<accrual::UserYieldCheckpoint> {
+fn set_yield_stream(env: &Env, stream: &YieldVestingStream) {
     env.storage()
-        .persistent()
-        .get(&DataKey::UserYieldCheckpoint(user.clone()))
+        .instance()
+        .set(&DataKey::YieldVestingStream, stream);
 }
 
-fn set_user_yield_checkpoint(env: &Env, user: &Address, checkpoint: accrual::UserYieldCheckpoint) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::UserYieldCheckpoint(user.clone()), &checkpoint);
-}
-
-/// Resolves the correct starting checkpoint for a user with no stored
-/// `UserYieldCheckpoint` yet — the two-cases distinction the pure `accrual`
-/// module cannot make on its own (see its module docs). A user who already
-/// held a position before the accumulator was introduced (signalled by a
-/// pre-existing `FirstDepositAt` record) is grandfathered in at
-/// `MIGRATION_LAZY_INDEX`, giving them no retroactive credit for yield
-/// reported before this feature existed but also not penalising them.
-/// A genuinely new depositor joins at the current index, so they earn
-/// nothing from yield reported before they held any shares.
-fn default_checkpoint_for(
-    env: &Env,
-    user: &Address,
-    current_index: i128,
-) -> accrual::UserYieldCheckpoint {
-    if has_first_deposit_at(env, user) {
-        accrual::UserYieldCheckpoint {
-            user_index: accrual::MIGRATION_LAZY_INDEX,
-            accrued: 0,
-        }
-    } else {
-        accrual::UserYieldCheckpoint {
-            user_index: current_index,
-            accrued: 0,
-        }
+/// Amount of `stream` that has vested by `now` but is not yet reflected in
+/// `stream.released`. Linear vesting: `total * elapsed / duration`, capped
+/// at `total - released` so a stale stream (nobody called anything for a
+/// long time) never over-releases. Rounds down — the vault-favouring
+/// direction — so a fraction of a base unit can be left stranded in the
+/// stream forever rather than ever over-crediting `TotalAssets`.
+fn vested_amount(stream: &YieldVestingStream, now: u64) -> i128 {
+    let remaining = stream.total.saturating_sub(stream.released);
+    if remaining <= 0 || now <= stream.started_at {
+        return 0;
     }
+    if now >= stream.ends_at {
+        return remaining;
+    }
+    let duration = stream.ends_at.saturating_sub(stream.started_at);
+    if duration == 0 {
+        return remaining;
+    }
+    let elapsed = now - stream.started_at;
+    let total_vested_by_now =
+        nester_common::fees::mul_div(stream.total, elapsed as i128, duration as i128).unwrap_or(0);
+    total_vested_by_now
+        .saturating_sub(stream.released)
+        .clamp(0, remaining)
 }
 
-/// Brings `user`'s yield checkpoint up to date against the current global
-/// index and their CURRENT share balance. Must be called before any
-/// operation changes that user's share balance (deposit/withdraw/emergency
-/// exit) or resets their position (harvest), so the sync always covers the
-/// period during which the pre-change share balance was actually held.
-fn sync_user(env: &Env, user: &Address) {
-    let current_index = get_yield_index(env);
-    let shares = get_shares(env, user);
-    let checkpoint = get_user_yield_checkpoint(env, user)
-        .unwrap_or_else(|| default_checkpoint_for(env, user, current_index));
-    let result = accrual::sync(checkpoint, current_index, shares)
-        .unwrap_or_else(|e| panic_with_error!(env, e));
-    set_user_yield_checkpoint(env, user, result.checkpoint);
+/// Releases whatever portion of the active yield stream has vested since it
+/// was last touched, adding it to `TotalAssets` exactly like `report_yield`
+/// already did before this stream existed. A no-op (cheap: one storage read)
+/// when there is no active stream or nothing has vested yet.
+///
+/// Must be called before any operation that reads `TotalAssets`/share price
+/// in a way that matters for fairness between holders — deposit, withdraw,
+/// harvest, and report_yield itself (so a new report correctly folds in any
+/// unreleased remainder of the previous one; see
+/// `start_or_extend_yield_stream`) — so no caller can ever observe a share
+/// price that omits yield which has already, in real time, finished vesting.
+fn release_vested_yield(env: &Env) {
+    let Some(mut stream) = get_yield_stream(env) else {
+        return;
+    };
+    let now = env.ledger().timestamp();
+    let to_release = vested_amount(&stream, now);
+    if to_release <= 0 {
+        return;
+    }
+
+    let total_assets = get_total_assets(env);
+    let new_total = total_assets
+        .checked_add(to_release)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ArithmeticOverflow));
+    set_total_assets(env, new_total);
+    sync_vault_token_total_assets(env);
+
+    stream.released = stream
+        .released
+        .checked_add(to_release)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ArithmeticOverflow));
+    set_yield_stream(env, &stream);
+
     emit_event(
         env,
         VAULT,
-        USER_YIELD_ACCRUED,
-        user.clone(),
-        UserYieldAccruedEventData {
-            user: user.clone(),
-            accrued: result.checkpoint.accrued,
-            user_index: result.checkpoint.user_index,
+        YIELD_RELEASED,
+        env.current_contract_address(),
+        YieldReleasedEventData {
+            released: to_release,
+            remaining: stream.total.saturating_sub(stream.released),
         },
     );
 }
 
-/// Sniping-resistant per-user pending entitlement from the time-weighted
-/// accumulator — distinct from the vault-wide [`VaultContract::pending_yield`].
-/// A pure view: does not mutate the caller's checkpoint.
-fn pending_yield_for(env: &Env, user: &Address) -> i128 {
-    let current_index = get_yield_index(env);
-    let shares = get_shares(env, user);
-    let checkpoint = get_user_yield_checkpoint(env, user)
-        .unwrap_or_else(|| default_checkpoint_for(env, user, current_index));
-    accrual::pending_entitlement(checkpoint, current_index, shares)
-        .unwrap_or_else(|e| panic_with_error!(env, e))
+/// Starts a new vesting stream for `amount`, folding in whatever portion of
+/// a still-active previous stream has not yet vested (its `total -
+/// released`, after `release_vested_yield` has already moved the vested
+/// portion out). Folding the remainder in — rather than either discarding it
+/// or leaving two streams running — means a manager who reports yield
+/// frequently cannot reset an in-flight stream to grief holders who were
+/// about to receive it, and cannot accidentally double-pay by starting a
+/// second concurrent stream either.
+///
+/// `amount` may be negative (an impairment): it is applied to `TotalAssets`
+/// immediately rather than vested, mirroring the pre-vesting behaviour for
+/// losses — there is no sniping concern to guard against for a loss (nobody
+/// benefits from front-running a markdown), and vesting a loss would leave
+/// share price overstated for longer than necessary, working against
+/// depositors rather than protecting them.
+fn start_or_extend_yield_stream(env: &Env, amount: i128) {
+    if amount < 0 {
+        let total_assets = get_total_assets(env);
+        let new_total = total_assets
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::ArithmeticOverflow));
+        set_total_assets(env, new_total);
+        sync_vault_token_total_assets(env);
+        return;
+    }
+    if amount == 0 {
+        return;
+    }
+
+    let now = env.ledger().timestamp();
+    let carry_over = get_yield_stream(env)
+        .map(|s| s.total.saturating_sub(s.released))
+        .unwrap_or(0);
+    let total = amount
+        .checked_add(carry_over)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ArithmeticOverflow));
+
+    let period = get_yield_vesting_period(env);
+    let ends_at = now
+        .checked_add(period)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ArithmeticOverflow));
+
+    let stream = YieldVestingStream {
+        total,
+        released: 0,
+        started_at: now,
+        ends_at,
+    };
+    set_yield_stream(env, &stream);
+
+    emit_event(
+        env,
+        VAULT,
+        YIELD_STREAM_STARTED,
+        env.current_contract_address(),
+        YieldStreamStartedEventData {
+            total,
+            started_at: now,
+            ends_at,
+        },
+    );
 }
 
 fn get_total_reported_yield(env: &Env) -> i128 {
@@ -2220,6 +2317,13 @@ impl VaultContract {
             panic_with_error!(&env, ContractError::Unauthorized);
         }
 
+        // Release whatever has already vested from a prior report before
+        // touching TotalAssets again, so a still-active stream's progress is
+        // captured exactly once (via start_or_extend_yield_stream's
+        // carry-over calculation below) rather than either lost or
+        // double-counted against this new report.
+        release_vested_yield(&env);
+
         let total_assets = get_total_assets(&env);
 
         // Yield-sanity trip (#817): an implausible single report is not
@@ -2230,36 +2334,16 @@ impl VaultContract {
             return;
         }
 
-        let new_total = total_assets
-            .checked_add(amount)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArithmeticOverflow));
-        set_total_assets(&env, new_total);
-        sync_vault_token_total_assets(&env);
-
-        // Time-weighted yield accumulator (issue #803): distribute this
-        // report across the index by total shares outstanding *before* this
-        // report's effect, so late depositors of THIS same transaction
-        // cannot retroactively claim it. When total_shares is zero the
-        // report is parked (index left unchanged) — there is no one to
-        // attribute it to yet.
-        let old_index = get_yield_index(&env);
-        let total_shares = vault_token_client(&env).total_supply();
-        if let Some(new_index) = accrual::apply_report(old_index, amount, total_shares)
-            .unwrap_or_else(|e| panic_with_error!(&env, e))
-        {
-            set_yield_index(&env, new_index);
-            emit_event(
-                &env,
-                VAULT,
-                YIELD_IDX_UPD,
-                caller.clone(),
-                YieldIndexUpdatedEventData {
-                    old_index,
-                    new_index,
-                    amount,
-                },
-            );
-        }
+        // Time-vested yield reports (issue #803): a positive report is
+        // spread into TotalAssets linearly over a vesting window rather than
+        // landing all at once, so a deposit made immediately before this
+        // call can only ever capture the sliver that vests during however
+        // long the depositor actually goes on to hold shares afterward — not
+        // the whole report, which is what let a snipe-and-immediately-
+        // withdraw capture disproportionate value under instant application.
+        // A negative amount (an impairment) is still applied immediately;
+        // see start_or_extend_yield_stream's doc comment for why.
+        start_or_extend_yield_stream(&env, amount);
 
         // Track per-caller pending yield and aggregate reported yield for harvest.
         // Only accumulate positive yield; losses (negative amount) reduce
@@ -2310,7 +2394,7 @@ impl VaultContract {
         require_active(&env);
         breaker::require_not_full_halt(&env);
         user.require_auth();
-        sync_user(&env, &user);
+        release_vested_yield(&env);
 
         let shares = get_shares(&env, &user);
         let redeemable = vault_token_client(&env).amount_for_shares(&shares);
@@ -3181,7 +3265,7 @@ impl VaultContract {
 
         user.require_auth();
         accrue_management_fee(&env);
-        sync_user(&env, &user);
+        release_vested_yield(&env);
 
         // Validate the exchange-rate state before moving funds. In particular,
         // a live share supply backed by zero assets is insolvent and must not
@@ -3343,7 +3427,7 @@ impl VaultContract {
 
         user.require_auth();
         accrue_management_fee(&env);
-        sync_user(&env, &user);
+        release_vested_yield(&env);
 
         let current_shares = get_shares(&env, &user);
         if shares > current_shares {
@@ -3515,7 +3599,7 @@ impl VaultContract {
         }
 
         user.require_auth();
-        sync_user(&env, &user);
+        release_vested_yield(&env);
 
         let principal = get_user_principal(&env, &user);
         if principal <= 0 {
@@ -3754,6 +3838,7 @@ impl VaultContract {
 
     fn process_fair_queue_internal(env: Env, _caller: Address, max_entries: u32) -> u32 {
         require_initialized(&env);
+        release_vested_yield(&env);
 
         let available_liquidity = get_vault_liquid_reserves(&env);
         let plan = queue::plan_fills(&env, max_entries, available_liquidity, |shares| {
@@ -4065,14 +4150,39 @@ impl VaultContract {
         gross.saturating_sub(accrued_fees)
     }
 
-    /// Sniping-resistant, per-user pending entitlement from the
-    /// time-weighted yield accumulator (issue #803) — a read-only
-    /// projection that does not mutate the caller's checkpoint. Distinct
-    /// from [`Self::pending_yield`], which reports the vault-wide
-    /// distributable surplus with no per-user attribution.
-    pub fn pending_yield_for_user(env: Env, user: Address) -> i128 {
+    /// Amount of a reported yield still vesting and not yet reflected in
+    /// share price (issue #803) — a pure read, does not release anything.
+    /// Distinct from [`Self::pending_yield`], which reports the vault's
+    /// distributable token-balance surplus, not the vesting stream's
+    /// remaining, not-yet-landed amount.
+    pub fn pending_vesting_yield(env: Env) -> i128 {
         require_initialized(&env);
-        pending_yield_for(&env, &user)
+        match get_yield_stream(&env) {
+            Some(stream) => stream.total.saturating_sub(stream.released),
+            None => 0,
+        }
+    }
+
+    /// Returns the vesting window new `report_yield` calls use to spread a
+    /// positive amount into `TotalAssets`. Does not affect a stream already
+    /// in progress.
+    pub fn get_yield_vesting_period(env: Env) -> u64 {
+        require_initialized(&env);
+        get_yield_vesting_period(&env)
+    }
+
+    /// Admin-only: reconfigure the vesting window future `report_yield`
+    /// calls use. Clamped to `[MIN_YIELD_VESTING_SECONDS,
+    /// MAX_YIELD_VESTING_SECONDS]` — a window that is too short reintroduces
+    /// the sniping hole this feature exists to close; one with no ceiling
+    /// could indefinitely delay legitimate yield from ever landing.
+    pub fn set_yield_vesting_period(env: Env, caller: Address, seconds: u64) {
+        caller.require_auth();
+        AccessControl::require_role(&env, &caller, Role::Admin);
+        let clamped = seconds.clamp(MIN_YIELD_VESTING_SECONDS, MAX_YIELD_VESTING_SECONDS);
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldVestingPeriodSeconds, &clamped);
     }
 
     pub fn withdrawal_fee_preview(env: Env, user: Address, shares: i128) -> WithdrawalFeePreview {

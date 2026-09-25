@@ -909,16 +909,16 @@ fn two_of_two_threshold_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
-// Time-weighted yield accumulator: sniping resistance (issue #803)
+// Time-vested yield reports: sniping resistance (issue #803)
 //
-// These exercise the contract-level `pending_yield_for_user` view — the
-// sniping-resistant, per-user entitlement from the accumulator — against the
-// exact attack the feature exists to prevent: depositing right before a
-// yield report to capture disproportionate credit for it. They deliberately
-// use `pending_yield_for_user`, not `harvest`'s payout, since this diff is
-// scoped as an additive accounting/attribution layer that does not (yet)
-// change what `harvest`/`withdraw` actually pay out — see `accrual.rs`'s
-// module docs.
+// report_yield no longer applies a positive amount to TotalAssets/share
+// price instantly; it vests linearly over `get_yield_vesting_period()`
+// (default 24h). These exercise the actual attack the feature exists to
+// prevent — depositing right before a report, then withdrawing quickly, to
+// capture disproportionate share-price appreciation from that report —
+// against the REAL payout path (deposit/withdraw/harvest), not a parallel
+// accounting view, since this design keeps yield inside share price rather
+// than tracking a separate per-user entitlement.
 // ---------------------------------------------------------------------------
 
 fn grant_yield_reporter(h: &NesterHarness) {
@@ -930,88 +930,264 @@ fn accrue_yield_for_test(h: &NesterHarness, amount: i128) {
     h.vault().report_yield(&h.admin, &amount);
 }
 
-#[test]
-fn depositing_after_a_yield_report_earns_nothing_from_that_report() {
-    let h = NesterHarness::setup();
-    grant_yield_reporter(&h);
+fn advance_time(h: &NesterHarness, seconds: u64) {
+    let now = h.env.ledger().timestamp();
+    h.env.ledger().set_timestamp(now + seconds);
+}
 
-    let long_holder = h.create_user();
-    h.mint_deposit_tokens(&long_holder, 10_000_000);
-    h.vault().deposit(&long_holder, &10_000_000, &0);
-
-    // Yield lands while only the long-tenured holder has any shares.
-    accrue_yield_for_test(&h, 1_000_000);
-
-    // The attacker deposits only now, after the report already happened.
-    let attacker = h.create_user();
-    h.mint_deposit_tokens(&attacker, 10_000_000);
-    h.vault().deposit(&attacker, &10_000_000, &0);
-
-    let long_holder_pending = h.vault().pending_yield_for_user(&long_holder);
-    let attacker_pending = h.vault().pending_yield_for_user(&attacker);
-
-    assert_eq!(
-        long_holder_pending, 1_000_000,
-        "the long-tenured holder captures the full report reported before the attacker joined"
+/// Zero every fee and disable the circuit breaker so the sniping-resistance
+/// assertions below isolate share-price/vesting arithmetic, matching
+/// share_price_tests.rs's convention for the same reason.
+fn isolate_share_price(h: &NesterHarness) {
+    h.vault().set_fee_config(
+        &h.admin,
+        &vault_contract::FeeConfig {
+            performance_fee_bps: 0,
+            management_fee_bps: 0,
+            early_withdrawal_fee_bps: 0,
+            treasury_address: h.treasury_id.clone(),
+        },
     );
-    assert_eq!(
-        attacker_pending, 0,
-        "a depositor who joins after a report must earn nothing from it, regardless of share price"
+    h.vault().set_circuit_breaker_config(
+        &h.admin,
+        &vault_contract::CircuitBreakerConfig {
+            threshold_bps: 10_000,
+            window_seconds: 7_200,
+        },
     );
 }
 
+/// `VaultContract::withdraw` returns the CALLER'S REMAINING share balance,
+/// not the assets paid out (see `withdraw_internal`'s final `new_user_shares`
+/// return) — so these tests measure actual payout via the deposit token's
+/// own balance delta, exactly like `fee_tests.rs`'s treasury-payout
+/// assertions do, rather than trusting withdraw's return value as a payout
+/// amount.
+fn withdraw_all_and_measure_payout(h: &NesterHarness, user: &Address) -> i128 {
+    let before = token::Client::new(&h.env, &h.deposit_token_id).balance(user);
+    let shares = h.token().balance(user);
+    h.vault().withdraw(user, &shares, &0);
+    let after = token::Client::new(&h.env, &h.deposit_token_id).balance(user);
+    after - before
+}
+
 #[test]
-fn depositing_immediately_before_a_report_earns_no_more_than_an_equal_long_term_holder() {
+fn snipe_deposit_immediately_before_report_then_immediate_withdraw_captures_almost_nothing() {
     let h = NesterHarness::setup();
     grant_yield_reporter(&h);
+    isolate_share_price(&h);
 
     let long_holder = h.create_user();
     h.mint_deposit_tokens(&long_holder, 10_000_000);
     h.vault().deposit(&long_holder, &10_000_000, &0);
 
-    // The attacker deposits an equal amount immediately before the report,
-    // in the same instant as far as the accumulator's index is concerned
-    // (no report has happened between the two deposits).
+    // Attacker deposits an equal amount immediately before the report.
     let attacker = h.create_user();
     h.mint_deposit_tokens(&attacker, 10_000_000);
     h.vault().deposit(&attacker, &10_000_000, &0);
 
     accrue_yield_for_test(&h, 2_000_000);
 
-    let long_holder_pending = h.vault().pending_yield_for_user(&long_holder);
-    let attacker_pending = h.vault().pending_yield_for_user(&attacker);
+    // The classic snipe: withdraw again immediately (same ledger timestamp),
+    // before any real time has passed for the report to vest.
+    let attacker_out = withdraw_all_and_measure_payout(&h, &attacker);
+    let attacker_profit = attacker_out - 10_000_000;
 
-    // Both hold equal shares over the identical index movement, so they earn
-    // identically — the attacker gets no premium for timing the deposit
-    // right before the report, only their fair per-share slice of it.
-    assert_eq!(
-        long_holder_pending, attacker_pending,
-        "equal shares synced at the same index must earn identically from a report — no snipe premium"
+    // Bounded by construction: at t=0 into a 24h vesting window, essentially
+    // nothing has vested yet, so the attacker's payout is at most their
+    // original principal plus a negligible rounding sliver — nowhere near
+    // their naive 1,000,000 (half the report) "fair per-share slice".
+    assert!(
+        attacker_profit < 100,
+        "attacker profit from an instant snipe-and-exit must be near zero, got {attacker_profit}"
     );
-    assert_eq!(long_holder_pending, 1_000_000);
-    assert_eq!(attacker_pending, 1_000_000);
 }
 
 #[test]
-fn withdrawing_immediately_after_a_report_does_not_forfeit_the_synced_entitlement() {
+fn snipe_deposit_captures_only_the_fraction_of_the_report_that_vests_before_exit() {
     let h = NesterHarness::setup();
     grant_yield_reporter(&h);
+    isolate_share_price(&h);
+
+    let long_holder = h.create_user();
+    h.mint_deposit_tokens(&long_holder, 10_000_000);
+    h.vault().deposit(&long_holder, &10_000_000, &0);
+
+    let attacker = h.create_user();
+    h.mint_deposit_tokens(&attacker, 10_000_000);
+    h.vault().deposit(&attacker, &10_000_000, &0);
+
+    accrue_yield_for_test(&h, 2_000_000); // vests over 24h by default
+
+    // Attacker holds for only 1/24th of the vesting window (1 hour) before
+    // exiting — a snipe that at least waits a little, rather than the same
+    // instant.
+    advance_time(&h, 60 * 60);
+    let attacker_out = withdraw_all_and_measure_payout(&h, &attacker);
+    let attacker_profit = attacker_out - 10_000_000;
+
+    // At most ~1/24th of the attacker's fair per-share slice of the full
+    // report (1,000,000) should have vested and be capturable: comfortably
+    // under half of a full 24h holder's eventual share, with real headroom
+    // for the fee/rounding this vault also applies on withdrawal.
+    assert!(
+        attacker_profit < 100_000,
+        "attacker profit after holding only 1/24 of the vesting window must be far below the full per-share report share (1,000,000), got {attacker_profit}"
+    );
+}
+
+#[test]
+fn long_tenured_holder_who_waits_out_the_vesting_window_captures_the_full_report() {
+    let h = NesterHarness::setup();
+    grant_yield_reporter(&h);
+    isolate_share_price(&h);
+
+    let long_holder = h.create_user();
+    h.mint_deposit_tokens(&long_holder, 10_000_000);
+    h.vault().deposit(&long_holder, &10_000_000, &0);
+
+    accrue_yield_for_test(&h, 1_000_000);
+
+    // Nobody else ever deposits; the long holder waits the full vesting
+    // window out before withdrawing everything.
+    advance_time(&h, 24 * 60 * 60);
+    let out = withdraw_all_and_measure_payout(&h, &long_holder);
+    let profit = out - 10_000_000;
+
+    assert_eq!(
+        profit, 1_000_000,
+        "a holder who genuinely waits out the full vesting window captures the entire report"
+    );
+}
+
+#[test]
+fn depositing_after_a_report_still_shares_in_whatever_has_not_yet_vested() {
+    // Unlike a per-user checkpoint model, vesting is a property of the
+    // STREAM, not of any one address: once yield is inside share price,
+    // whoever holds shares while the remainder vests shares in it — this is
+    // an intentional, documented trade-off of choosing "vest into share
+    // price" over "track individual entitlement" (see report_yield's doc
+    // comment). What this test pins down is that the SHARE captured is
+    // bounded by how much is actually still vesting, not the whole
+    // historical report.
+    let h = NesterHarness::setup();
+    grant_yield_reporter(&h);
+    isolate_share_price(&h);
+
+    let long_holder = h.create_user();
+    h.mint_deposit_tokens(&long_holder, 10_000_000);
+    h.vault().deposit(&long_holder, &10_000_000, &0);
+
+    accrue_yield_for_test(&h, 2_400_000); // 24h window: 100,000/hour
+
+    // Half the window elapses with only the long holder present.
+    advance_time(&h, 12 * 60 * 60);
+
+    // A late depositor joins now, matching the long holder's shares.
+    let late = h.create_user();
+    h.mint_deposit_tokens(&late, 10_000_000);
+    // Half the report (1,200,000) has already vested into share price by
+    // now, so the late depositor's shares cost proportionally more — they
+    // are buying INTO the appreciated price, not getting it for free.
+    h.vault().deposit(&late, &10_000_000, &0);
+
+    // The remaining window elapses; the remaining half of the report vests
+    // while both hold equal shares, so it splits evenly between them.
+    advance_time(&h, 12 * 60 * 60);
+
+    let long_out = withdraw_all_and_measure_payout(&h, &long_holder);
+    let late_out = withdraw_all_and_measure_payout(&h, &late);
+
+    // The long holder's total profit (bought in before any vesting, present
+    // for the whole window) must exceed the late depositor's (bought in
+    // after half had already vested into the price they paid).
+    assert!(
+        long_out - 10_000_000 > late_out - 10_000_000,
+        "a holder present for the full vesting window must out-earn one who joined halfway through: long={} late={}",
+        long_out - 10_000_000,
+        late_out - 10_000_000
+    );
+}
+
+#[test]
+fn a_second_report_folds_in_the_first_reports_unvested_remainder() {
+    let h = NesterHarness::setup();
+    grant_yield_reporter(&h);
+    isolate_share_price(&h);
+
+    let user = h.create_user();
+    h.mint_deposit_tokens(&user, 10_000_000);
+    h.vault().deposit(&user, &10_000_000, &0);
+
+    accrue_yield_for_test(&h, 1_000_000);
+    advance_time(&h, 60 * 60); // 1 hour into the first 24h stream
+
+    // A second report lands before the first has finished vesting.
+    accrue_yield_for_test(&h, 500_000);
+
+    let pending = h.vault().pending_vesting_yield();
+    // Approximately the unvested remainder of report 1 (~958,333) plus all
+    // of report 2 (500,000) — comfortably more than either report alone,
+    // proving the first report's progress was neither discarded nor
+    // double-counted (it would exceed 1,500,000 only if genuinely
+    // double-applied).
+    assert!(
+        pending > 1_300_000 && pending <= 1_500_000,
+        "expected the unvested remainder of report 1 plus all of report 2, got {pending}"
+    );
+}
+
+#[test]
+fn impairment_applies_immediately_without_vesting() {
+    let h = NesterHarness::setup();
+    grant_yield_reporter(&h);
+    isolate_share_price(&h);
+
+    let user = h.create_user();
+    h.mint_deposit_tokens(&user, 10_000_000);
+    h.vault().deposit(&user, &10_000_000, &0);
+
+    accrue_yield_for_test(&h, 2_000_000);
+    advance_time(&h, 24 * 60 * 60); // fully vested
+
+    let before_loss = h
+        .vault()
+        .withdrawal_fee_preview(&user, &h.token().balance(&user));
+    let _ = before_loss;
+
+    // A loss is reported (negative amount) — unlike a gain, this must land
+    // immediately, not vest, so share price reflects the impairment right
+    // away rather than overstating holder value while it "vests down".
+    h.mint_deposit_tokens(&h.vault_id, 0); // no-op, keeps parity with accrue_yield_for_test's shape
+    h.vault().report_yield(&h.admin, &(-1_000_000));
+
+    let pending = h.vault().pending_vesting_yield();
+    assert_eq!(
+        pending, 0,
+        "an impairment must not be queued as a vesting stream; it applies to TotalAssets immediately"
+    );
+}
+
+#[test]
+fn withdrawing_immediately_after_a_fully_vested_report_pays_out_the_full_amount() {
+    let h = NesterHarness::setup();
+    grant_yield_reporter(&h);
+    isolate_share_price(&h);
 
     let user = h.create_user();
     h.mint_deposit_tokens(&user, 10_000_000);
     h.vault().deposit(&user, &10_000_000, &0);
 
     accrue_yield_for_test(&h, 500_000);
+    advance_time(&h, 24 * 60 * 60); // fully vested
 
-    // A partial withdrawal syncs the user's checkpoint before burning
-    // shares, so the entitlement earned up to this point is preserved in
-    // `accrued` rather than silently lost because the share balance that
-    // earned it is about to shrink.
+    let before = token::Client::new(&h.env, &h.deposit_token_id).balance(&user);
     h.vault().withdraw(&user, &4_000_000, &0);
-
-    let pending_after_withdraw = h.vault().pending_yield_for_user(&user);
+    let out = token::Client::new(&h.env, &h.deposit_token_id).balance(&user) - before;
+    // 4/10 of principal (10,000,000) plus 4/10 of the fully-vested yield
+    // (500,000) = 4,000,000 + 200,000 = 4,200,000.
     assert_eq!(
-        pending_after_withdraw, 500_000,
-        "a sync on withdraw must preserve entitlement already earned on the pre-withdrawal balance"
+        out, 4_200_000,
+        "a fully-vested report must be reflected in share price exactly like the pre-vesting instant-application model was"
     );
 }

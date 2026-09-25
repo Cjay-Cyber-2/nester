@@ -236,6 +236,22 @@ fn advance_time(env: &Env, seconds: u64) {
     });
 }
 
+/// Advance past a `report_yield` call's vesting window (issue #803's
+/// default: 24h) and force the vested amount to actually release into
+/// `TotalAssets`. A zero-amount `report_yield` call is a side-effect-free
+/// way to trigger the release (it still runs `release_vested_yield` at its
+/// own top, before the zero-amount early return), since a pure view like
+/// `total_assets()`/`share_price()` never releases anything itself.
+///
+/// Many tests written before vesting existed call `report_yield` and
+/// immediately assume its full effect lands in the very next call — this
+/// makes that assumption true again without changing what each test is
+/// actually asserting.
+fn fully_vest(env: &Env, vault: &VaultContractClient, admin: &Address) {
+    advance_time(env, vault.get_yield_vesting_period() + 1);
+    vault.report_yield(admin, &0);
+}
+
 // ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
@@ -476,8 +492,21 @@ fn withdrawal_charges_perf_fee_only_on_realized_user_yield() {
     vault.deposit(&user, &deposit, &0);
     vault.grant_role(&admin, &admin, &Role::Manager);
 
+    // Zero the management fee: this test's exact expected numbers predate
+    // fully_vest's real time-advance below, which would otherwise accrue a
+    // small management fee this test isn't about.
+    let mut fee_config: FeeConfig = vault.get_fee_config();
+    fee_config.management_fee_bps = 0;
+    vault.set_fee_config(&admin, &fee_config);
+
     // Double share price in accounting so user has 1000 of realized yield.
+    // A short vesting period lands the report well inside the 1-day
+    // MinLockPeriod, matching this test's "early fee = 2" expectation
+    // (the default 24h vesting window would land exactly at/past the lock
+    // boundary).
+    vault.set_yield_vesting_period(&admin, &(60 * 60));
     vault.report_yield(&admin, &deposit);
+    fully_vest(&env, &vault, &admin);
     // Add liquid reserves so transfer can satisfy the larger withdrawal amount.
     vault.deposit(&liquidity_provider, &deposit, &0);
 
@@ -499,14 +528,19 @@ fn performance_fee_charges_only_realized_yield_not_principal() {
     mint(&token, &user_a, 2_000 * XLM);
     mint(&token, &user_b, 2_000 * XLM);
 
-    // Disable early withdrawal fee so this test isolates performance fee behavior.
+    // Disable early withdrawal and management fees so this test isolates
+    // performance fee behavior. Management fee matters here specifically
+    // because fully_vest below advances real time, which would otherwise
+    // accrue a small but nonzero management fee this test isn't about.
     let mut fee_config: FeeConfig = vault.get_fee_config();
     fee_config.early_withdrawal_fee_bps = 0;
+    fee_config.management_fee_bps = 0;
     vault.set_fee_config(&admin, &fee_config);
 
     vault.grant_role(&admin, &admin, &Role::Manager);
     vault.deposit(&user_a, &(1_000 * XLM), &0);
     vault.report_yield(&admin, &(100 * XLM));
+    fully_vest(&env, &vault, &admin);
 
     // User B enters after yield is already reflected in share price.
     let user_b_shares = vault.deposit(&user_b, &(1_000 * XLM), &0);
@@ -663,10 +697,11 @@ fn withdraw_reverts_when_min_assets_out_is_not_met() {
 // post-fee amount actually transferred, so a caller can use it directly as
 // `min_assets_out` for a fee-bearing withdrawal without tripping slippage.
 //
-// No time is advanced, so no management fee accrues (elapsed = 0) and the
-// preview models every fee the withdrawal applies exactly: the reported yield
-// triggers a performance fee, and remaining inside the MinLockPeriod triggers
-// the early-withdrawal fee.
+// Management fee is zeroed so the preview models every fee the withdrawal
+// applies exactly despite fully_vest below genuinely advancing real time
+// (issue #803's vesting needs a real elapsed window to release the report):
+// the reported yield triggers a performance fee, and remaining inside the
+// MinLockPeriod triggers the early-withdrawal fee.
 #[test]
 fn withdrawal_fee_preview_net_is_slippage_safe_as_min_assets_out() {
     let (env, admin, token, vault, _treasury) = setup();
@@ -675,8 +710,18 @@ fn withdrawal_fee_preview_net_is_slippage_safe_as_min_assets_out() {
     mint(&token, &user, deposit);
     vault.deposit(&user, &deposit, &0);
 
+    let mut fee_config: FeeConfig = vault.get_fee_config();
+    fee_config.management_fee_bps = 0;
+    vault.set_fee_config(&admin, &fee_config);
+
+    // A short vesting period lands the report well inside the 1-day
+    // MinLockPeriod, so the early-withdrawal-fee assertion below still
+    // applies (the default 24h vesting window would land exactly at/past
+    // the lock boundary).
     vault.grant_role(&admin, &admin, &Role::Manager);
+    vault.set_yield_vesting_period(&admin, &(60 * 60));
     vault.report_yield(&admin, &(500 * XLM));
+    fully_vest(&env, &vault, &admin);
     // Back the reported yield with real tokens so the vault can pay it out
     // (report_yield only updates share-price accounting).
     mint(&token, &vault.address, 500 * XLM);
@@ -1182,9 +1227,15 @@ fn test_read_only_queries() {
     assert_eq!(vault.total_shares(), deposit);
     assert_eq!(vault.share_price(), 10_000_000); // 1.0 share price initialized
 
-    // Simulate yield
+    // Simulate yield. Reports vest linearly (issue #803's default: 24h),
+    // so use the minimum allowed window (1h) here, short enough to fully
+    // land while still leaving the rest of DAY/2 comfortably inside the
+    // MinLockPeriod (= DAY) window the early-withdrawal-fee assertion below
+    // needs.
     vault.grant_role(&admin, &admin, &Role::Manager);
+    vault.set_yield_vesting_period(&admin, &(60 * 60));
     vault.report_yield(&admin, &(500 * XLM));
+    fully_vest(&env, &vault, &admin);
 
     assert_eq!(vault.total_shares(), deposit);
     assert_eq!(vault.share_price(), 15_000_000); // 1.5 share price
@@ -1525,6 +1576,7 @@ fn per_user_harvest_pays_the_treasury_the_full_fee() {
     vault.grant_role(&admin, &user, &Role::Manager);
     let yield_amount = 500 * XLM;
     vault.report_yield(&user, &yield_amount);
+    fully_vest(&env, &vault, &user);
 
     let treasury_token = token::Client::new(&env, &token.address);
     let before = treasury_token.balance(&treasury);
@@ -1581,6 +1633,7 @@ fn test_harvest_fee_calculation() {
     vault.grant_role(&admin, &admin, &Role::Manager);
     let yield_amount = 1_000 * XLM;
     vault.report_yield(&admin, &yield_amount);
+    fully_vest(&env, &vault, &admin);
 
     let result = vault.harvest(&user);
 
@@ -1610,6 +1663,7 @@ fn test_harvest_resets_user_yield_to_zero() {
 
     vault.grant_role(&admin, &admin, &Role::Manager);
     vault.report_yield(&admin, &(300 * XLM));
+    fully_vest(&env, &vault, &admin);
 
     let first = vault.harvest(&user);
     assert_eq!(first.gross_yield, 300 * XLM);
@@ -1692,6 +1746,7 @@ fn harvest_fee_burns_only_the_harvesting_users_shares() {
 
     vault.grant_role(&admin, &admin, &Role::Manager);
     vault.report_yield(&admin, &(500 * XLM));
+    fully_vest(&env, &vault, &admin);
 
     let shares_before = vault.get_shares(&user);
     let result = vault.harvest(&user);
@@ -1723,6 +1778,7 @@ fn performance_fee_does_not_dilute_passive_holders() {
     vault.grant_role(&admin, &admin, &Role::Manager);
     mint(&token, &vault.address, yield_amount);
     vault.report_yield(&admin, &yield_amount);
+    fully_vest(&env, &vault, &admin);
 
     let passive_value_before = vault.get_balance(&passive_holder);
     let share_price_before = vault.share_price();
@@ -2655,10 +2711,12 @@ mod proptests {
 
             let price_before = vault.share_price();
 
-            // Positive yield increases share price
+            // Positive yield increases share price, once vested (issue
+            // #803's linear vesting means it is not reflected instantly).
             let yield_val = initial_deposit * yield_pct / 100;
             vault.grant_role(&admin, &admin, &Role::Manager);
             vault.report_yield(&admin, &yield_val);
+            fully_vest(&env, &vault, &admin);
 
             let price_after_yield = vault.share_price();
             prop_assert!(

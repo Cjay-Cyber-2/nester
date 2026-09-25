@@ -124,10 +124,15 @@ fn test_full_lifecycle_deposit_to_withdraw() {
     h.vault()
         .record_source_allocation(&h.admin, &aave, &(DEPOSIT + YIELD_AMOUNT));
 
-    assert_eq!(h.token().total_assets(), DEPOSIT + YIELD_AMOUNT);
-
-    // 6. Advance ledger past min_lock_period (86 400 s) → no early-withdrawal fee
+    // 6. Advance ledger past min_lock_period (86 400 s) → no early-withdrawal
+    // fee. This report vests linearly over the same 24h window (issue
+    // #803's default); a zero-amount report is a side-effect-free way to
+    // force the vested portion to actually release into TotalAssets before
+    // reading it below (a pure view like total_assets() does not release
+    // anything itself).
     h.env.ledger().with_mut(|l| l.timestamp = 86_401);
+    h.vault().report_yield(&h.admin, &0);
+    assert_eq!(h.token().total_assets(), DEPOSIT + YIELD_AMOUNT);
 
     // 7. User withdraws all shares
     // Performance fee = 10 % of YIELD_AMOUNT = 100_000
@@ -278,7 +283,12 @@ fn test_upgrade_lifecycle_full_flow() {
     assert_eq!(v1, v2);
     assert_eq!(v1, 1);
 
-    // 8. Verify balances, shares, and accrued yield preserved
+    // 8. Verify balances, shares, and accrued yield preserved. The report
+    // vests linearly over 24h (issue #803's default), well inside the 48h
+    // ETA delay already elapsed above, but a pure view like total_assets()
+    // does not itself release anything — force it with a zero-amount
+    // report first.
+    h.vault().report_yield(&h.admin, &0);
     assert_eq!(h.token().balance(&user), shares);
     assert_eq!(h.token().total_assets(), DEPOSIT + YIELD_AMOUNT);
 }
