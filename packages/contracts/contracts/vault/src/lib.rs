@@ -7,8 +7,7 @@ pub mod conversion;
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contractimpl, contracttype, panic_with_error, symbol_short, token, Address, BytesN,
-    Env,
-    IntoVal, Symbol, Val, Vec,
+    Env, IntoVal, Symbol, Val, Vec,
 };
 
 pub use breaker::{BreakerConfig, BreakerStatus, Severity, TripReason};
@@ -121,6 +120,9 @@ const REBALANCE: Symbol = symbol_short!("REBAL");
 /// Emitted when a rebalance skips a source because its adapter failed.
 const SOURCE_SKIPPED: Symbol = symbol_short!("SRC_SKIP");
 const HARVEST: Symbol = symbol_short!("HARVEST");
+/// Time-vested yield report events (issue #803).
+const YIELD_STREAM_STARTED: Symbol = symbol_short!("YLD_STRT");
+const YIELD_RELEASED: Symbol = symbol_short!("YLD_RLSD");
 const MIN_REBALANCE_AMOUNT: i128 = 1;
 const DEFAULT_REBALANCE_COOLDOWN: u64 = 3600;
 /// Default rebalance slippage tolerance: 50 bps (0.5%) — issue #638.
@@ -204,6 +206,25 @@ pub struct WithdrawEventData {
 #[derive(Clone, Debug)]
 pub struct TimestampEventData {
     pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct YieldStreamStartedEventData {
+    /// Total amount now vesting over the stream's window (the new report's
+    /// amount plus any not-yet-vested remainder folded in from a prior
+    /// still-active stream — see `start_or_extend_yield_stream`).
+    pub total: i128,
+    pub started_at: u64,
+    pub ends_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct YieldReleasedEventData {
+    /// Amount moved from the vesting stream into `TotalAssets` this call.
+    pub released: i128,
+    pub remaining: i128,
 }
 
 #[contracttype]
@@ -405,6 +426,13 @@ enum DataKey {
     MaxPriceDeviationBps, // u32 maximum price deviation
     // --- Referral integration (issue #818) ---
     ReferralContract,
+    // --- Time-vested yield reports (issue #803) ---
+    /// The active (or most recently active) yield vesting stream. Absent
+    /// means no stream has ever started.
+    YieldVestingStream,
+    /// Vesting window duration in seconds, admin-configurable. Absent
+    /// defaults to [`DEFAULT_YIELD_VESTING_SECONDS`].
+    YieldVestingPeriodSeconds,
 }
 
 /// Why a penalty was charged (issue #805). `LockBreak` and `WeightDeviation`
@@ -884,12 +912,9 @@ fn circuit_breaker_headroom(env: &Env) -> i128 {
         return 0;
     };
 
-    let threshold = nester_common::fees::mul_div(
-        get_total_assets(env),
-        config.threshold_bps as i128,
-        10_000,
-    )
-    .unwrap_or(0);
+    let threshold =
+        nester_common::fees::mul_div(get_total_assets(env), config.threshold_bps as i128, 10_000)
+            .unwrap_or(0);
     // A zero threshold disables the check in `check_circuit_breaker`.
     if threshold == 0 {
         return i128::MAX;
@@ -1262,6 +1287,199 @@ fn set_user_yield(env: &Env, user: &Address, amount: i128) {
     env.storage()
         .persistent()
         .set(&DataKey::UserYield(user.clone()), &amount);
+}
+
+// ---------------------------------------------------------------------------
+// Time-vested yield reports (issue #803)
+//
+// A reported yield amount is no longer applied to TotalAssets instantly.
+// Instead it vests linearly into TotalAssets over YieldVestingPeriodSeconds,
+// closing the sniping hole: a deposit made immediately before report_yield
+// only captures the sliver of the report that vests during however long the
+// attacker actually holds shares afterward, not the whole amount. A holder
+// who was already present before the report captures proportionally more,
+// simply by virtue of the report continuing to vest while they hold shares
+// and the attacker (if they withdraw quickly) does not.
+//
+// This intentionally keeps yield inside share price (this vault's existing,
+// deeply-entangled model — fee tiers, the emergency-withdrawal preview, and
+// the referral hook all read `redeemable = amount_for_shares(shares)` as the
+// yield signal); vesting is exactly the mechanism the issue itself names as
+// an acceptable alternative to a full accumulator migration when the two are
+// in tension, and is far smaller surgery on a 4000+ line vault contract.
+// ---------------------------------------------------------------------------
+
+/// Default vesting window: how long a single `report_yield` call's amount
+/// takes to fully land in `TotalAssets`. 1 day - long enough that a
+/// snipe-and-immediately-withdraw captures only a small fraction of a
+/// report, short enough that legitimate holders are not kept waiting an
+/// unreasonable time for genuinely-earned yield to become spendable.
+/// Admin-adjustable between 1 hour and 30 days via `set_yield_vesting_period`.
+pub const DEFAULT_YIELD_VESTING_SECONDS: u64 = 24 * 60 * 60;
+pub const MIN_YIELD_VESTING_SECONDS: u64 = 60 * 60;
+pub const MAX_YIELD_VESTING_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct YieldVestingStream {
+    /// Total amount this stream will release by `ends_at`.
+    pub total: i128,
+    /// Amount already released into `TotalAssets` so far.
+    pub released: i128,
+    pub started_at: u64,
+    pub ends_at: u64,
+}
+
+fn get_yield_vesting_period(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::YieldVestingPeriodSeconds)
+        .unwrap_or(DEFAULT_YIELD_VESTING_SECONDS)
+}
+
+fn get_yield_stream(env: &Env) -> Option<YieldVestingStream> {
+    env.storage().instance().get(&DataKey::YieldVestingStream)
+}
+
+fn set_yield_stream(env: &Env, stream: &YieldVestingStream) {
+    env.storage()
+        .instance()
+        .set(&DataKey::YieldVestingStream, stream);
+}
+
+/// Amount of `stream` that has vested by `now` but is not yet reflected in
+/// `stream.released`. Linear vesting: `total * elapsed / duration`, capped
+/// at `total - released` so a stale stream (nobody called anything for a
+/// long time) never over-releases. Rounds down — the vault-favouring
+/// direction — so a fraction of a base unit can be left stranded in the
+/// stream forever rather than ever over-crediting `TotalAssets`.
+fn vested_amount(stream: &YieldVestingStream, now: u64) -> i128 {
+    let remaining = stream.total.saturating_sub(stream.released);
+    if remaining <= 0 || now <= stream.started_at {
+        return 0;
+    }
+    if now >= stream.ends_at {
+        return remaining;
+    }
+    let duration = stream.ends_at.saturating_sub(stream.started_at);
+    if duration == 0 {
+        return remaining;
+    }
+    let elapsed = now - stream.started_at;
+    let total_vested_by_now =
+        nester_common::fees::mul_div(stream.total, elapsed as i128, duration as i128).unwrap_or(0);
+    total_vested_by_now
+        .saturating_sub(stream.released)
+        .clamp(0, remaining)
+}
+
+/// Releases whatever portion of the active yield stream has vested since it
+/// was last touched, adding it to `TotalAssets` exactly like `report_yield`
+/// already did before this stream existed. A no-op (cheap: one storage read)
+/// when there is no active stream or nothing has vested yet.
+///
+/// Must be called before any operation that reads `TotalAssets`/share price
+/// in a way that matters for fairness between holders — deposit, withdraw,
+/// harvest, and report_yield itself (so a new report correctly folds in any
+/// unreleased remainder of the previous one; see
+/// `start_or_extend_yield_stream`) — so no caller can ever observe a share
+/// price that omits yield which has already, in real time, finished vesting.
+fn release_vested_yield(env: &Env) {
+    let Some(mut stream) = get_yield_stream(env) else {
+        return;
+    };
+    let now = env.ledger().timestamp();
+    let to_release = vested_amount(&stream, now);
+    if to_release <= 0 {
+        return;
+    }
+
+    let total_assets = get_total_assets(env);
+    let new_total = total_assets
+        .checked_add(to_release)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ArithmeticOverflow));
+    set_total_assets(env, new_total);
+    sync_vault_token_total_assets(env);
+
+    stream.released = stream
+        .released
+        .checked_add(to_release)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ArithmeticOverflow));
+    set_yield_stream(env, &stream);
+
+    emit_event(
+        env,
+        VAULT,
+        YIELD_RELEASED,
+        env.current_contract_address(),
+        YieldReleasedEventData {
+            released: to_release,
+            remaining: stream.total.saturating_sub(stream.released),
+        },
+    );
+}
+
+/// Starts a new vesting stream for `amount`, folding in whatever portion of
+/// a still-active previous stream has not yet vested (its `total -
+/// released`, after `release_vested_yield` has already moved the vested
+/// portion out). Folding the remainder in — rather than either discarding it
+/// or leaving two streams running — means a manager who reports yield
+/// frequently cannot reset an in-flight stream to grief holders who were
+/// about to receive it, and cannot accidentally double-pay by starting a
+/// second concurrent stream either.
+///
+/// `amount` may be negative (an impairment): it is applied to `TotalAssets`
+/// immediately rather than vested, mirroring the pre-vesting behaviour for
+/// losses — there is no sniping concern to guard against for a loss (nobody
+/// benefits from front-running a markdown), and vesting a loss would leave
+/// share price overstated for longer than necessary, working against
+/// depositors rather than protecting them.
+fn start_or_extend_yield_stream(env: &Env, amount: i128) {
+    if amount < 0 {
+        let total_assets = get_total_assets(env);
+        let new_total = total_assets
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::ArithmeticOverflow));
+        set_total_assets(env, new_total);
+        sync_vault_token_total_assets(env);
+        return;
+    }
+    if amount == 0 {
+        return;
+    }
+
+    let now = env.ledger().timestamp();
+    let carry_over = get_yield_stream(env)
+        .map(|s| s.total.saturating_sub(s.released))
+        .unwrap_or(0);
+    let total = amount
+        .checked_add(carry_over)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ArithmeticOverflow));
+
+    let period = get_yield_vesting_period(env);
+    let ends_at = now
+        .checked_add(period)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ArithmeticOverflow));
+
+    let stream = YieldVestingStream {
+        total,
+        released: 0,
+        started_at: now,
+        ends_at,
+    };
+    set_yield_stream(env, &stream);
+
+    emit_event(
+        env,
+        VAULT,
+        YIELD_STREAM_STARTED,
+        env.current_contract_address(),
+        YieldStreamStartedEventData {
+            total,
+            started_at: now,
+            ends_at,
+        },
+    );
 }
 
 fn get_total_reported_yield(env: &Env) -> i128 {
@@ -2099,6 +2317,13 @@ impl VaultContract {
             panic_with_error!(&env, ContractError::Unauthorized);
         }
 
+        // Release whatever has already vested from a prior report before
+        // touching TotalAssets again, so a still-active stream's progress is
+        // captured exactly once (via start_or_extend_yield_stream's
+        // carry-over calculation below) rather than either lost or
+        // double-counted against this new report.
+        release_vested_yield(&env);
+
         let total_assets = get_total_assets(&env);
 
         // Yield-sanity trip (#817): an implausible single report is not
@@ -2109,11 +2334,16 @@ impl VaultContract {
             return;
         }
 
-        let new_total = total_assets
-            .checked_add(amount)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArithmeticOverflow));
-        set_total_assets(&env, new_total);
-        sync_vault_token_total_assets(&env);
+        // Time-vested yield reports (issue #803): a positive report is
+        // spread into TotalAssets linearly over a vesting window rather than
+        // landing all at once, so a deposit made immediately before this
+        // call can only ever capture the sliver that vests during however
+        // long the depositor actually goes on to hold shares afterward — not
+        // the whole report, which is what let a snipe-and-immediately-
+        // withdraw capture disproportionate value under instant application.
+        // A negative amount (an impairment) is still applied immediately;
+        // see start_or_extend_yield_stream's doc comment for why.
+        start_or_extend_yield_stream(&env, amount);
 
         // Track per-caller pending yield and aggregate reported yield for harvest.
         // Only accumulate positive yield; losses (negative amount) reduce
@@ -2164,6 +2394,7 @@ impl VaultContract {
         require_active(&env);
         breaker::require_not_full_halt(&env);
         user.require_auth();
+        release_vested_yield(&env);
 
         let shares = get_shares(&env, &user);
         let redeemable = vault_token_client(&env).amount_for_shares(&shares);
@@ -3034,6 +3265,7 @@ impl VaultContract {
 
         user.require_auth();
         accrue_management_fee(&env);
+        release_vested_yield(&env);
 
         // Validate the exchange-rate state before moving funds. In particular,
         // a live share supply backed by zero assets is insolvent and must not
@@ -3195,6 +3427,7 @@ impl VaultContract {
 
         user.require_auth();
         accrue_management_fee(&env);
+        release_vested_yield(&env);
 
         let current_shares = get_shares(&env, &user);
         if shares > current_shares {
@@ -3366,6 +3599,7 @@ impl VaultContract {
         }
 
         user.require_auth();
+        release_vested_yield(&env);
 
         let principal = get_user_principal(&env, &user);
         if principal <= 0 {
@@ -3604,6 +3838,7 @@ impl VaultContract {
 
     fn process_fair_queue_internal(env: Env, _caller: Address, max_entries: u32) -> u32 {
         require_initialized(&env);
+        release_vested_yield(&env);
 
         let available_liquidity = get_vault_liquid_reserves(&env);
         let plan = queue::plan_fills(&env, max_entries, available_liquidity, |shares| {
@@ -3915,6 +4150,41 @@ impl VaultContract {
         gross.saturating_sub(accrued_fees)
     }
 
+    /// Amount of a reported yield still vesting and not yet reflected in
+    /// share price (issue #803) — a pure read, does not release anything.
+    /// Distinct from [`Self::pending_yield`], which reports the vault's
+    /// distributable token-balance surplus, not the vesting stream's
+    /// remaining, not-yet-landed amount.
+    pub fn pending_vesting_yield(env: Env) -> i128 {
+        require_initialized(&env);
+        match get_yield_stream(&env) {
+            Some(stream) => stream.total.saturating_sub(stream.released),
+            None => 0,
+        }
+    }
+
+    /// Returns the vesting window new `report_yield` calls use to spread a
+    /// positive amount into `TotalAssets`. Does not affect a stream already
+    /// in progress.
+    pub fn get_yield_vesting_period(env: Env) -> u64 {
+        require_initialized(&env);
+        get_yield_vesting_period(&env)
+    }
+
+    /// Admin-only: reconfigure the vesting window future `report_yield`
+    /// calls use. Clamped to `[MIN_YIELD_VESTING_SECONDS,
+    /// MAX_YIELD_VESTING_SECONDS]` — a window that is too short reintroduces
+    /// the sniping hole this feature exists to close; one with no ceiling
+    /// could indefinitely delay legitimate yield from ever landing.
+    pub fn set_yield_vesting_period(env: Env, caller: Address, seconds: u64) {
+        caller.require_auth();
+        AccessControl::require_role(&env, &caller, Role::Admin);
+        let clamped = seconds.clamp(MIN_YIELD_VESTING_SECONDS, MAX_YIELD_VESTING_SECONDS);
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldVestingPeriodSeconds, &clamped);
+    }
+
     pub fn withdrawal_fee_preview(env: Env, user: Address, shares: i128) -> WithdrawalFeePreview {
         require_initialized(&env);
         let current_shares = get_shares(&env, &user);
@@ -4083,7 +4353,6 @@ impl VaultContract {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests

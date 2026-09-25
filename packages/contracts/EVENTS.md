@@ -58,6 +58,29 @@ Emitted when the vault is unpaused.
 - **Topics**: `(VAULT, UNPAUSE, admin: Address)`
 - **Data**: `{ timestamp: u64 }`
 
+### YLD_STRT (yield_stream_started) — issue #803
+Emitted by `report_yield` whenever a positive `amount` starts (or extends) a linear vesting stream. Not applied to `TotalAssets` all at once: instead it vests over `total` divided across `ends_at - started_at`, closing the sniping hole where a deposit made immediately before a report could capture a full instant share-price jump. If a prior stream was still active, its unreleased remainder is folded into `total` rather than discarded or double-counted. Not emitted for a negative `amount` (an impairment), which still applies to `TotalAssets` immediately — see `YLD_RLSD`'s note on why.
+- **Topics**: `(VAULT, YLD_STRT, contract_address: Address)`
+- **Data**:
+    ```rust
+    {
+        total: i128,      // total amount now vesting over this stream's window
+        started_at: u64,  // ledger timestamp the stream started at
+        ends_at: u64       // ledger timestamp the stream fully vests by
+    }
+    ```
+
+### YLD_RLSD (yield_released) — issue #803
+Emitted whenever `release_vested_yield` moves a newly-vested portion of the active stream into `TotalAssets`. Runs at the top of every operation that reads `TotalAssets`/share price in a way that matters for fairness between holders — `deposit`, `withdraw`, `harvest`, and `report_yield` itself — so no caller can ever observe a share price that omits yield which has already, in real time, finished vesting. A no-op (and no event) when there is no active stream or nothing has vested since the last release.
+- **Topics**: `(VAULT, YLD_RLSD, contract_address: Address)`
+- **Data**:
+    ```rust
+    {
+        released: i128,   // amount moved into TotalAssets this call
+        remaining: i128   // amount still left to vest in the active stream
+    }
+    ```
+
 ## Yield Registry Events (Contract Symbol: `REGISTRY`)
 
 ### SOURCE_ADDED

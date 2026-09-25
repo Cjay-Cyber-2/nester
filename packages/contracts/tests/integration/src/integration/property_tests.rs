@@ -15,7 +15,7 @@
 extern crate std;
 
 use proptest::prelude::*;
-use soroban_sdk::Address;
+use soroban_sdk::{testutils::Ledger as _, Address};
 
 use nester_access_control::Role;
 use nester_test_utils::NesterHarness;
@@ -28,7 +28,7 @@ const MIN_DEPOSIT: i128 = 10_000_000;
 enum VaultOp {
     Deposit { user_idx: usize, amount: i128 },
     Withdraw { user_idx: usize, share_bps: u32 },
-    Harvest { user_idx: usize },          // Per-user harvest triggers performance fee (issue #1029)
+    Harvest { user_idx: usize }, // Per-user harvest triggers performance fee (issue #1029)
     ReportYield { yield_bps: u32 },
     ReportLoss { loss_bps: u32 },
     CollectFees,
@@ -432,6 +432,13 @@ fn regression_collect_fees_with_exhausted_reserves_does_not_panic() {
     h.mint_deposit_tokens(&h.vault_id, yield_amount);
     h.vault().report_yield(&h.admin, &yield_amount);
 
+    // The report vests linearly over 24h (issue #803's default); advance
+    // past that window so the withdrawals below see real yield-backed
+    // value and accrue a performance fee, matching this test's premise.
+    h.env.ledger().with_mut(|l| {
+        l.timestamp += h.vault().get_yield_vesting_period() + 1;
+    });
+
     let first_balance = h.token().balance(&users[1]);
     let first_withdrawal = (first_balance * 8_953 / 10_000).max(1);
     h.vault().withdraw(&users[1], &first_withdrawal, &0);
@@ -503,6 +510,13 @@ fn regression_1029_harvest_pays_treasury_correctly() {
     let yield_amount = deposit_amount * 50 / 100; // 50% yield
     h.mint_deposit_tokens(&h.vault_id, yield_amount);
     h.vault().report_yield(&h.admin, &yield_amount);
+
+    // The report vests linearly over 24h (issue #803's default); advance
+    // past that window so harvest below sees the full amount, matching this
+    // test's "treasury receives the full reported fee" premise.
+    h.env.ledger().with_mut(|l| {
+        l.timestamp += h.vault().get_yield_vesting_period() + 1;
+    });
 
     // Get treasury address from fee config
     let fee_config = h.vault().get_fee_config();

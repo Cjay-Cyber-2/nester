@@ -78,8 +78,13 @@ fn test_full_lifecycle_deposit_to_withdraw() {
     disable_circuit_breaker(&h);
 
     // 1. Register yield source, configure strategy weights, wire to vault
-    h.registry()
-        .register_source(&h.admin, &aave, &h.create_user(), &None, &ProtocolType::Lending);
+    h.registry().register_source(
+        &h.admin,
+        &aave,
+        &h.create_user(),
+        &None,
+        &ProtocolType::Lending,
+    );
     h.strategy().set_weights(
         &h.admin,
         &vec![
@@ -119,10 +124,15 @@ fn test_full_lifecycle_deposit_to_withdraw() {
     h.vault()
         .record_source_allocation(&h.admin, &aave, &(DEPOSIT + YIELD_AMOUNT));
 
-    assert_eq!(h.token().total_assets(), DEPOSIT + YIELD_AMOUNT);
-
-    // 6. Advance ledger past min_lock_period (86 400 s) → no early-withdrawal fee
+    // 6. Advance ledger past min_lock_period (86 400 s) → no early-withdrawal
+    // fee. This report vests linearly over the same 24h window (issue
+    // #803's default); a zero-amount report is a side-effect-free way to
+    // force the vested portion to actually release into TotalAssets before
+    // reading it below (a pure view like total_assets() does not release
+    // anything itself).
     h.env.ledger().with_mut(|l| l.timestamp = 86_401);
+    h.vault().report_yield(&h.admin, &0);
+    assert_eq!(h.token().total_assets(), DEPOSIT + YIELD_AMOUNT);
 
     // 7. User withdraws all shares
     // Performance fee = 10 % of YIELD_AMOUNT = 100_000
@@ -241,7 +251,10 @@ fn test_upgrade_lifecycle_full_flow() {
     // 2. Grant Upgrader role
     h.vault().grant_role(&h.admin, &upgrader, &Role::Upgrader);
 
-    let valid_hash = h.env.deployer().upload_contract_wasm(soroban_sdk::Bytes::new(&h.env));
+    let valid_hash = h
+        .env
+        .deployer()
+        .upload_contract_wasm(soroban_sdk::Bytes::new(&h.env));
     let now = h.env.ledger().timestamp();
     let eta = now + MIN_UPGRADE_DELAY_VAULT;
 
@@ -270,7 +283,12 @@ fn test_upgrade_lifecycle_full_flow() {
     assert_eq!(v1, v2);
     assert_eq!(v1, 1);
 
-    // 8. Verify balances, shares, and accrued yield preserved
+    // 8. Verify balances, shares, and accrued yield preserved. The report
+    // vests linearly over 24h (issue #803's default), well inside the 48h
+    // ETA delay already elapsed above, but a pure view like total_assets()
+    // does not itself release anything — force it with a zero-amount
+    // report first.
+    h.vault().report_yield(&h.admin, &0);
     assert_eq!(h.token().balance(&user), shares);
     assert_eq!(h.token().total_assets(), DEPOSIT + YIELD_AMOUNT);
 }
@@ -288,7 +306,10 @@ fn test_upgrade_cancellation_and_access_control() {
     let eta = now + MIN_UPGRADE_DELAY_VAULT;
 
     // Outsider cannot propose
-    assert!(h.vault().try_propose_upgrade(&outsider, &dummy_hash, &eta).is_err());
+    assert!(h
+        .vault()
+        .try_propose_upgrade(&outsider, &dummy_hash, &eta)
+        .is_err());
 
     // Upgrader proposes
     h.vault().propose_upgrade(&upgrader, &dummy_hash, &eta);
@@ -304,7 +325,10 @@ fn test_upgrade_cancellation_and_access_control() {
     h.env.ledger().with_mut(|l| l.timestamp = eta);
 
     // Cancelled proposal cannot be executed
-    assert!(h.vault().try_execute_upgrade(&outsider, &dummy_hash).is_err());
+    assert!(h
+        .vault()
+        .try_execute_upgrade(&outsider, &dummy_hash)
+        .is_err());
 }
 
 #[test]
@@ -345,7 +369,9 @@ fn test_treasury_upgrade_delay_requirement() {
 
     // Delay less than 7 days (e.g. 48 hours) fails for Treasury
     let short_eta = now + MIN_UPGRADE_DELAY_VAULT;
-    assert!(treasury_client.try_propose_upgrade(&upgrader, &dummy_hash, &short_eta).is_err());
+    assert!(treasury_client
+        .try_propose_upgrade(&upgrader, &dummy_hash, &short_eta)
+        .is_err());
 
     // Delay of 7 days succeeds for Treasury
     let valid_eta = now + MIN_UPGRADE_DELAY_TREASURY;
@@ -384,6 +410,3 @@ fn test_storage_ttl_persistence_after_long_ledger_advance() {
     assert_eq!(remaining, 0);
     assert_eq!(h.token().balance(&user), 0);
 }
-
-
-

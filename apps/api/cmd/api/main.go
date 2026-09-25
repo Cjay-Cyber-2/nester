@@ -475,13 +475,17 @@ func run() error {
 	)
 	adminService.SetTemplateRepository(goalTemplateRepo)
 	adminHandler := handler.NewAdminHandler(adminService, userService)
-	adminHandler.SetEventSyncer(&stellarpkg.EventSyncer{
+	// DepositObserver is attached below, once savingsGamificationSvc exists
+	// (this EventSyncer is held by pointer, so setting the field later still
+	// reaches the same instance the admin handler holds).
+	adminEventSyncer := &stellarpkg.EventSyncer{
 		DB:         db,
 		SysRepo:    systemStateRepository,
 		RPCURL:     cfg.Stellar().RPCURL(),
 		Logger:     baseLogger,
 		RPCOptions: sorobanRPCOptions,
-	})
+	}
+	adminHandler.SetEventSyncer(adminEventSyncer)
 	adminHandler.SetLeadership(schedulerLeadership)
 
 	// Historical chain backfill/resync tool (#840): operator-triggered via
@@ -1106,6 +1110,11 @@ func run() error {
 		service.DispatcherGamificationNotifier{Dispatcher: notificationDispatcher2},
 	)
 	savingsGoalSvc.SetGamificationRecorder(savingsGamificationSvc)
+	// General vault deposits (not just goal-tied ones) also drive the streak
+	// engine, via the chain indexer's post-commit deposit notification.
+	// Wired into both the live poller and the admin one-shot sync so whichever
+	// applies a given event first is also the one that notifies it.
+	adminEventSyncer.DepositObserver = savingsGamificationSvc
 	savingsGamificationHandler := handler.NewSavingsGamificationHandler(savingsGamificationSvc)
 	savingsGamificationHandler.Register(mux)
 	savingsGoalSvc.SetTemplateRepository(goalTemplateRepo)
@@ -1711,10 +1720,11 @@ func run() error {
 	// to the freshness tracker, which the metrics collector and the API
 	// freshness headers both read.
 	stellarpkg.StartEventIndexer(shutdownCtx, baseLogger, db, systemStateRepository, stellarpkg.IndexerOptions{
-		RPCURL:     cfg.Stellar().RPCURL(),
-		HTTPClient: chainBreakers.client(appMetrics, stellarpkg.IndexerRequestTimeout, metrics.UpstreamSorobanRPC),
-		RPCOptions: sorobanRPCOptions,
-		Recorder:   indexerFreshness,
+		RPCURL:          cfg.Stellar().RPCURL(),
+		HTTPClient:      chainBreakers.client(appMetrics, stellarpkg.IndexerRequestTimeout, metrics.UpstreamSorobanRPC),
+		RPCOptions:      sorobanRPCOptions,
+		Recorder:        indexerFreshness,
+		DepositObserver: savingsGamificationSvc,
 	})
 
 	// The metrics endpoint runs on its own listener so it is never reachable
