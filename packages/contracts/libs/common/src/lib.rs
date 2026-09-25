@@ -6,6 +6,7 @@ pub mod constants;
 pub mod errors;
 pub mod events;
 pub mod fees;
+pub mod goal_effort;
 pub mod reentrancy;
 pub mod storage;
 pub mod upgrade;
