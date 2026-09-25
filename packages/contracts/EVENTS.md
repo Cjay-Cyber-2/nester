@@ -58,27 +58,26 @@ Emitted when the vault is unpaused.
 - **Topics**: `(VAULT, UNPAUSE, admin: Address)`
 - **Data**: `{ timestamp: u64 }`
 
-### YLD_IDX (yield_index_updated) — issue #803
-Emitted by `report_yield` whenever it moves the time-weighted yield accumulator's global index (a positive `amount` distributed across current total shares; a negative `amount` is an impairment). Not emitted when `total_shares` is zero — the report is parked with the index left unchanged, since there is no one yet to attribute it to.
-- **Topics**: `(VAULT, YLD_IDX, caller: Address)`
+### YLD_STRT (yield_stream_started) — issue #803
+Emitted by `report_yield` whenever a positive `amount` starts (or extends) a linear vesting stream. Not applied to `TotalAssets` all at once: instead it vests over `total` divided across `ends_at - started_at`, closing the sniping hole where a deposit made immediately before a report could capture a full instant share-price jump. If a prior stream was still active, its unreleased remainder is folded into `total` rather than discarded or double-counted. Not emitted for a negative `amount` (an impairment), which still applies to `TotalAssets` immediately — see `YLD_RLSD`'s note on why.
+- **Topics**: `(VAULT, YLD_STRT, contract_address: Address)`
 - **Data**:
     ```rust
     {
-        old_index: i128,  // index before this report (scale 1e18 = 1.0)
-        new_index: i128,  // index after this report
-        amount: i128      // the reported amount (can be negative)
+        total: i128,      // total amount now vesting over this stream's window
+        started_at: u64,  // ledger timestamp the stream started at
+        ends_at: u64       // ledger timestamp the stream fully vests by
     }
     ```
 
-### USR_ACCR (user_yield_accrued) — issue #803
-Emitted by `sync_user`, called at the top of `deposit`, `withdraw`, `harvest`, and `emergency_withdraw` — every path that is about to change a user's share balance or reset their position. Brings the user's yield checkpoint up to date against the global index and their pre-change share balance, so entitlement already earned survives the balance change that follows. This is the sniping-resistant, per-user accounting layer described in `vault/src/accrual.rs`; it is additive and does not (yet) change what `harvest`/`withdraw` actually pay out — see `pending_yield_for_user` for its own read-only view.
-- **Topics**: `(VAULT, USR_ACCR, user: Address)`
+### YLD_RLSD (yield_released) — issue #803
+Emitted whenever `release_vested_yield` moves a newly-vested portion of the active stream into `TotalAssets`. Runs at the top of every operation that reads `TotalAssets`/share price in a way that matters for fairness between holders — `deposit`, `withdraw`, `harvest`, and `report_yield` itself — so no caller can ever observe a share price that omits yield which has already, in real time, finished vesting. A no-op (and no event) when there is no active stream or nothing has vested since the last release.
+- **Topics**: `(VAULT, YLD_RLSD, contract_address: Address)`
 - **Data**:
     ```rust
     {
-        user: Address,
-        accrued: i128,     // user's total unclaimed entitlement after this sync
-        user_index: i128   // global index the checkpoint now points at
+        released: i128,   // amount moved into TotalAssets this call
+        remaining: i128   // amount still left to vest in the active stream
     }
     ```
 
