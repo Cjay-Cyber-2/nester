@@ -78,8 +78,13 @@ fn test_full_lifecycle_deposit_to_withdraw() {
     disable_circuit_breaker(&h);
 
     // 1. Register yield source, configure strategy weights, wire to vault
-    h.registry()
-        .register_source(&h.admin, &aave, &h.create_user(), &None, &ProtocolType::Lending);
+    h.registry().register_source(
+        &h.admin,
+        &aave,
+        &h.create_user(),
+        &None,
+        &ProtocolType::Lending,
+    );
     h.strategy().set_weights(
         &h.admin,
         &vec![
@@ -241,7 +246,10 @@ fn test_upgrade_lifecycle_full_flow() {
     // 2. Grant Upgrader role
     h.vault().grant_role(&h.admin, &upgrader, &Role::Upgrader);
 
-    let valid_hash = h.env.deployer().upload_contract_wasm(soroban_sdk::Bytes::new(&h.env));
+    let valid_hash = h
+        .env
+        .deployer()
+        .upload_contract_wasm(soroban_sdk::Bytes::new(&h.env));
     let now = h.env.ledger().timestamp();
     let eta = now + MIN_UPGRADE_DELAY_VAULT;
 
@@ -288,7 +296,10 @@ fn test_upgrade_cancellation_and_access_control() {
     let eta = now + MIN_UPGRADE_DELAY_VAULT;
 
     // Outsider cannot propose
-    assert!(h.vault().try_propose_upgrade(&outsider, &dummy_hash, &eta).is_err());
+    assert!(h
+        .vault()
+        .try_propose_upgrade(&outsider, &dummy_hash, &eta)
+        .is_err());
 
     // Upgrader proposes
     h.vault().propose_upgrade(&upgrader, &dummy_hash, &eta);
@@ -304,7 +315,10 @@ fn test_upgrade_cancellation_and_access_control() {
     h.env.ledger().with_mut(|l| l.timestamp = eta);
 
     // Cancelled proposal cannot be executed
-    assert!(h.vault().try_execute_upgrade(&outsider, &dummy_hash).is_err());
+    assert!(h
+        .vault()
+        .try_execute_upgrade(&outsider, &dummy_hash)
+        .is_err());
 }
 
 #[test]
@@ -345,7 +359,9 @@ fn test_treasury_upgrade_delay_requirement() {
 
     // Delay less than 7 days (e.g. 48 hours) fails for Treasury
     let short_eta = now + MIN_UPGRADE_DELAY_VAULT;
-    assert!(treasury_client.try_propose_upgrade(&upgrader, &dummy_hash, &short_eta).is_err());
+    assert!(treasury_client
+        .try_propose_upgrade(&upgrader, &dummy_hash, &short_eta)
+        .is_err());
 
     // Delay of 7 days succeeds for Treasury
     let valid_eta = now + MIN_UPGRADE_DELAY_TREASURY;
@@ -384,6 +400,3 @@ fn test_storage_ttl_persistence_after_long_ledger_advance() {
     assert_eq!(remaining, 0);
     assert_eq!(h.token().balance(&user), 0);
 }
-
-
-

@@ -220,7 +220,10 @@ fn test_minimum_deposit_one_unit() {
 
     let floor = assets_to_shares_down(MIN_DEPOSIT_AMOUNT, total_assets, total_supply).unwrap();
     let ceil = assets_to_shares_up(MIN_DEPOSIT_AMOUNT, total_assets, total_supply).unwrap();
-    assert!(ceil > floor, "the chosen share price must not divide evenly");
+    assert!(
+        ceil > floor,
+        "the chosen share price must not divide evenly"
+    );
     assert_eq!(
         shares, floor,
         "a deposit must round shares down, in the protocol's favour"
@@ -274,5 +277,84 @@ fn test_zero_assets_with_live_supply_rejects_new_share_conversion() {
     assert_eq!(
         assets_to_shares_up(10, 0, 3),
         Err(ContractError::InvalidOperation)
+    );
+}
+
+/// Time-weighted yield accumulator conservation (issue #803), run against
+/// the live contract rather than the pure `accrual` module (which has its
+/// own dependency-free 1000-cycle conservation test over the accounting
+/// math directly — see `vault/src/accrual.rs`). Running anywhere near that
+/// many real cross-contract calls here exhausts the test host's CPU
+/// budget, so this instead runs a much smaller number of cycles sufficient
+/// to exercise several report/withdraw interleavings against the actual
+/// contract and storage layer: four users join at staggered points, a
+/// pseudo-random sequence of yield reports and partial withdrawals runs,
+/// and the sum of every user's `pending_yield_for_user` must never exceed
+/// total yield actually reported: rounding may only ever favour the vault
+/// (under-allocate), never over-allocate and create yield from nothing.
+#[test]
+fn accumulator_conservation_across_randomized_cycles() {
+    let h = NesterHarness::setup();
+    zero_fees(&h);
+    disable_circuit_breaker(&h);
+    h.vault().grant_role(&h.admin, &h.admin, &Role::Manager);
+
+    const INITIAL_DEPOSIT: i128 = 50_000_000;
+    let users: std::vec::Vec<_> = (0..4)
+        .map(|_| {
+            let user = h.create_user();
+            h.mint_deposit_tokens(&user, INITIAL_DEPOSIT * 2);
+            h.vault().deposit(&user, &INITIAL_DEPOSIT, &0);
+            user
+        })
+        .collect();
+
+    let mut total_reported: i128 = 0;
+    let mut seed: u64 = 0xa5a5_1234_dead_beef;
+
+    for cycle in 0..40u32 {
+        // xorshift64 -- deterministic, dependency-free pseudo-randomness.
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+
+        // Every 5th cycle, report a small amount of yield.
+        if cycle % 5 == 0 {
+            let amount = (seed % 50_000) as i128 + 1;
+            h.mint_deposit_tokens(&h.vault_id, amount);
+            h.vault().report_yield(&h.admin, &amount);
+            total_reported = total_reported.checked_add(amount).unwrap();
+        }
+
+        // Every 9th cycle, one user makes a small partial withdrawal,
+        // which syncs their checkpoint before burning shares.
+        if cycle % 9 == 0 {
+            let idx = (seed as usize) % users.len();
+            let user = &users[idx];
+            let shares = h.token().balance(user);
+            if shares > 1_000 {
+                let withdraw_shares = shares / 20; // 5%
+                if withdraw_shares > 0 {
+                    let _ = h.vault().try_withdraw(user, &withdraw_shares, &0);
+                }
+            }
+        }
+    }
+
+    let total_pending: i128 = users
+        .iter()
+        .map(|u| h.vault().pending_yield_for_user(u))
+        .sum();
+
+    assert!(
+        total_pending <= total_reported,
+        "sum of per-user pending entitlements ({total_pending}) must never exceed total yield reported ({total_reported})"
+    );
+    // Rounding losses across 1000 cycles of small reports should stay
+    // negligible relative to the total reported.
+    let shortfall = total_reported - total_pending;
+    assert!(
+        shortfall <= total_reported / 100 + 10,
+        "rounding shortfall ({shortfall}) is larger than expected for {total_reported} reported"
     );
 }

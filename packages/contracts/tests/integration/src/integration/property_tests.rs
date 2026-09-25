@@ -28,7 +28,7 @@ const MIN_DEPOSIT: i128 = 10_000_000;
 enum VaultOp {
     Deposit { user_idx: usize, amount: i128 },
     Withdraw { user_idx: usize, share_bps: u32 },
-    Harvest { user_idx: usize },          // Per-user harvest triggers performance fee (issue #1029)
+    Harvest { user_idx: usize }, // Per-user harvest triggers performance fee (issue #1029)
     ReportYield { yield_bps: u32 },
     ReportLoss { loss_bps: u32 },
     CollectFees,

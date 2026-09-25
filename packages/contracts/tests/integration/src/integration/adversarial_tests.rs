@@ -4,7 +4,7 @@
 extern crate std;
 
 use nester_access_control::Role;
-use nester_common::{build_payload_bytes, Attestation, AttestedField, AttestationPayload};
+use nester_common::{build_payload_bytes, Attestation, AttestationPayload, AttestedField};
 use nester_test_utils::{register_reentrant_strategy, HostileVaultHarness, NesterHarness};
 use soroban_sdk::{
     symbol_short,
@@ -130,10 +130,20 @@ fn registered_strategy_rebalance_invokes_allowlisted_callee() {
 
     let aave = symbol_short!("aave");
     let blend = symbol_short!("blend");
-    h.registry()
-        .register_source(&h.admin, &aave, &h.create_user(), &None, &nester_common::ProtocolType::Lending);
-    h.registry()
-        .register_source(&h.admin, &blend, &h.create_user(), &None, &nester_common::ProtocolType::Lending);
+    h.registry().register_source(
+        &h.admin,
+        &aave,
+        &h.create_user(),
+        &None,
+        &nester_common::ProtocolType::Lending,
+    );
+    h.registry().register_source(
+        &h.admin,
+        &blend,
+        &h.create_user(),
+        &None,
+        &nester_common::ProtocolType::Lending,
+    );
     h.strategy()
         .update_strategy_params(&h.admin, &500u32, &10_000u32, &100u32);
     let weights = soroban_sdk::vec![
@@ -416,7 +426,7 @@ fn depositor_who_exits_before_distribution_is_not_retroactively_affected() {
 /// Generate a fresh ed25519 signing key and return the raw secret bytes and
 /// raw public-key bytes (32 bytes each).
 fn generate_ed25519_keypair() -> ([u8; 32], [u8; 32]) {
-    use ed25519_dalek::{SigningKey};
+    use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     let signing_key = SigningKey::generate(&mut OsRng);
     let secret_bytes: [u8; 32] = signing_key.to_bytes();
@@ -459,22 +469,21 @@ fn make_attestation(
 /// attester, returning the keypair and source id.
 fn setup_attested_registry() -> (
     NesterHarness,
-    [u8; 32],  // secret key
-    [u8; 32],  // public key
+    [u8; 32], // secret key
+    [u8; 32], // public key
     soroban_sdk::Symbol,
 ) {
     let h = NesterHarness::setup();
     let (secret, public) = generate_ed25519_keypair();
 
     let source_id = symbol_short!("aave");
-    h.registry()
-        .register_source(
-            &h.admin,
-            &source_id,
-            &h.create_user(),
-            &None,
-            &nester_common::ProtocolType::Lending,
-        );
+    h.registry().register_source(
+        &h.admin,
+        &source_id,
+        &h.create_user(),
+        &None,
+        &nester_common::ProtocolType::Lending,
+    );
 
     h.registry().register_attester(
         &h.admin,
@@ -751,8 +760,7 @@ fn attested_value_that_violates_deviation_limit_is_rejected() {
     );
 
     // Now tighten the deviation threshold to 100 bps.
-    h.registry()
-        .set_apy_deviation_threshold(&h.admin, &100u32);
+    h.registry().set_apy_deviation_threshold(&h.admin, &100u32);
 
     // Attempt to set APY = 9999 bps — change of 9499 bps, far exceeds 100 bps.
     let out_of_band_apy: u32 = 9_999;
@@ -808,7 +816,7 @@ fn tampered_payload_signature_is_rejected() {
     h.registry().update_apy_attested(
         &h.admin,
         &source_id,
-        &9000,    // different value from what was signed
+        &9000, // different value from what was signed
         &valid_from,
         &valid_until,
         &attestations,
@@ -822,14 +830,13 @@ fn tampered_payload_signature_is_rejected() {
 fn update_status_works_without_attesters() {
     let h = NesterHarness::setup();
     let source_id = symbol_short!("aave");
-    h.registry()
-        .register_source(
-            &h.admin,
-            &source_id,
-            &h.create_user(),
-            &None,
-            &nester_common::ProtocolType::Lending,
-        );
+    h.registry().register_source(
+        &h.admin,
+        &source_id,
+        &h.create_user(),
+        &None,
+        &nester_common::ProtocolType::Lending,
+    );
 
     // No attesters registered — but update_status must still work.
     h.registry()
@@ -848,14 +855,13 @@ fn two_of_two_threshold_succeeds() {
     let (secret2, public2) = generate_ed25519_keypair();
 
     let source_id = symbol_short!("blend");
-    h.registry()
-        .register_source(
-            &h.admin,
-            &source_id,
-            &h.create_user(),
-            &None,
-            &nester_common::ProtocolType::Lending,
-        );
+    h.registry().register_source(
+        &h.admin,
+        &source_id,
+        &h.create_user(),
+        &None,
+        &nester_common::ProtocolType::Lending,
+    );
     h.registry().register_attester(
         &h.admin,
         &BytesN::from_array(&h.env, &public1),
@@ -900,4 +906,112 @@ fn two_of_two_threshold_succeeds() {
 
     let source = h.registry().get_source(&source_id);
     assert_eq!(source.current_apy_bps, new_apy);
+}
+
+// ---------------------------------------------------------------------------
+// Time-weighted yield accumulator: sniping resistance (issue #803)
+//
+// These exercise the contract-level `pending_yield_for_user` view — the
+// sniping-resistant, per-user entitlement from the accumulator — against the
+// exact attack the feature exists to prevent: depositing right before a
+// yield report to capture disproportionate credit for it. They deliberately
+// use `pending_yield_for_user`, not `harvest`'s payout, since this diff is
+// scoped as an additive accounting/attribution layer that does not (yet)
+// change what `harvest`/`withdraw` actually pay out — see `accrual.rs`'s
+// module docs.
+// ---------------------------------------------------------------------------
+
+fn grant_yield_reporter(h: &NesterHarness) {
+    h.vault().grant_role(&h.admin, &h.admin, &Role::Manager);
+}
+
+fn accrue_yield_for_test(h: &NesterHarness, amount: i128) {
+    h.mint_deposit_tokens(&h.vault_id, amount);
+    h.vault().report_yield(&h.admin, &amount);
+}
+
+#[test]
+fn depositing_after_a_yield_report_earns_nothing_from_that_report() {
+    let h = NesterHarness::setup();
+    grant_yield_reporter(&h);
+
+    let long_holder = h.create_user();
+    h.mint_deposit_tokens(&long_holder, 10_000_000);
+    h.vault().deposit(&long_holder, &10_000_000, &0);
+
+    // Yield lands while only the long-tenured holder has any shares.
+    accrue_yield_for_test(&h, 1_000_000);
+
+    // The attacker deposits only now, after the report already happened.
+    let attacker = h.create_user();
+    h.mint_deposit_tokens(&attacker, 10_000_000);
+    h.vault().deposit(&attacker, &10_000_000, &0);
+
+    let long_holder_pending = h.vault().pending_yield_for_user(&long_holder);
+    let attacker_pending = h.vault().pending_yield_for_user(&attacker);
+
+    assert_eq!(
+        long_holder_pending, 1_000_000,
+        "the long-tenured holder captures the full report reported before the attacker joined"
+    );
+    assert_eq!(
+        attacker_pending, 0,
+        "a depositor who joins after a report must earn nothing from it, regardless of share price"
+    );
+}
+
+#[test]
+fn depositing_immediately_before_a_report_earns_no_more_than_an_equal_long_term_holder() {
+    let h = NesterHarness::setup();
+    grant_yield_reporter(&h);
+
+    let long_holder = h.create_user();
+    h.mint_deposit_tokens(&long_holder, 10_000_000);
+    h.vault().deposit(&long_holder, &10_000_000, &0);
+
+    // The attacker deposits an equal amount immediately before the report,
+    // in the same instant as far as the accumulator's index is concerned
+    // (no report has happened between the two deposits).
+    let attacker = h.create_user();
+    h.mint_deposit_tokens(&attacker, 10_000_000);
+    h.vault().deposit(&attacker, &10_000_000, &0);
+
+    accrue_yield_for_test(&h, 2_000_000);
+
+    let long_holder_pending = h.vault().pending_yield_for_user(&long_holder);
+    let attacker_pending = h.vault().pending_yield_for_user(&attacker);
+
+    // Both hold equal shares over the identical index movement, so they earn
+    // identically — the attacker gets no premium for timing the deposit
+    // right before the report, only their fair per-share slice of it.
+    assert_eq!(
+        long_holder_pending, attacker_pending,
+        "equal shares synced at the same index must earn identically from a report — no snipe premium"
+    );
+    assert_eq!(long_holder_pending, 1_000_000);
+    assert_eq!(attacker_pending, 1_000_000);
+}
+
+#[test]
+fn withdrawing_immediately_after_a_report_does_not_forfeit_the_synced_entitlement() {
+    let h = NesterHarness::setup();
+    grant_yield_reporter(&h);
+
+    let user = h.create_user();
+    h.mint_deposit_tokens(&user, 10_000_000);
+    h.vault().deposit(&user, &10_000_000, &0);
+
+    accrue_yield_for_test(&h, 500_000);
+
+    // A partial withdrawal syncs the user's checkpoint before burning
+    // shares, so the entitlement earned up to this point is preserved in
+    // `accrued` rather than silently lost because the share balance that
+    // earned it is about to shrink.
+    h.vault().withdraw(&user, &4_000_000, &0);
+
+    let pending_after_withdraw = h.vault().pending_yield_for_user(&user);
+    assert_eq!(
+        pending_after_withdraw, 500_000,
+        "a sync on withdraw must preserve entitlement already earned on the pre-withdrawal balance"
+    );
 }

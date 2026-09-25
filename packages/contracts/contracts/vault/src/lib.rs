@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod accrual;
 mod basket;
 mod breaker;
 pub mod conversion;
@@ -7,8 +8,7 @@ pub mod conversion;
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contractimpl, contracttype, panic_with_error, symbol_short, token, Address, BytesN,
-    Env,
-    IntoVal, Symbol, Val, Vec,
+    Env, IntoVal, Symbol, Val, Vec,
 };
 
 pub use breaker::{BreakerConfig, BreakerStatus, Severity, TripReason};
@@ -121,6 +121,9 @@ const REBALANCE: Symbol = symbol_short!("REBAL");
 /// Emitted when a rebalance skips a source because its adapter failed.
 const SOURCE_SKIPPED: Symbol = symbol_short!("SRC_SKIP");
 const HARVEST: Symbol = symbol_short!("HARVEST");
+/// Time-weighted yield accumulator events (issue #803).
+const YIELD_IDX_UPD: Symbol = symbol_short!("YLD_IDX");
+const USER_YIELD_ACCRUED: Symbol = symbol_short!("USR_ACCR");
 const MIN_REBALANCE_AMOUNT: i128 = 1;
 const DEFAULT_REBALANCE_COOLDOWN: u64 = 3600;
 /// Default rebalance slippage tolerance: 50 bps (0.5%) — issue #638.
@@ -204,6 +207,22 @@ pub struct WithdrawEventData {
 #[derive(Clone, Debug)]
 pub struct TimestampEventData {
     pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct YieldIndexUpdatedEventData {
+    pub old_index: i128,
+    pub new_index: i128,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct UserYieldAccruedEventData {
+    pub user: Address,
+    pub accrued: i128,
+    pub user_index: i128,
 }
 
 #[contracttype]
@@ -405,6 +424,9 @@ enum DataKey {
     MaxPriceDeviationBps, // u32 maximum price deviation
     // --- Referral integration (issue #818) ---
     ReferralContract,
+    // --- Time-weighted yield accumulator (issue #803) ---
+    YieldIndex,
+    UserYieldCheckpoint(Address),
 }
 
 /// Why a penalty was charged (issue #805). `LockBreak` and `WeightDeviation`
@@ -884,12 +906,9 @@ fn circuit_breaker_headroom(env: &Env) -> i128 {
         return 0;
     };
 
-    let threshold = nester_common::fees::mul_div(
-        get_total_assets(env),
-        config.threshold_bps as i128,
-        10_000,
-    )
-    .unwrap_or(0);
+    let threshold =
+        nester_common::fees::mul_div(get_total_assets(env), config.threshold_bps as i128, 10_000)
+            .unwrap_or(0);
     // A zero threshold disables the check in `check_circuit_breaker`.
     if threshold == 0 {
         return i128::MAX;
@@ -1262,6 +1281,108 @@ fn set_user_yield(env: &Env, user: &Address, amount: i128) {
     env.storage()
         .persistent()
         .set(&DataKey::UserYield(user.clone()), &amount);
+}
+
+// ---------------------------------------------------------------------------
+// Time-weighted yield accumulator (issue #803)
+//
+// This is an additive accounting/attribution layer only: it tracks, per
+// user, how much of the vault's reported yield they are entitled to based on
+// how long they held shares relative to the global index — the standard
+// sniping-resistant "MasterChef"-style pattern (see `accrual` module docs
+// for the full accounting model). It does NOT change what `harvest` or
+// `withdraw` actually pay out; those remain on the existing
+// principal/redeemable-value accounting. `pending_yield_for` exposes this
+// layer's own view for callers who want the sniping-resistant figure
+// specifically.
+// ---------------------------------------------------------------------------
+
+fn get_yield_index(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::YieldIndex)
+        .unwrap_or(accrual::SCALE)
+}
+
+fn set_yield_index(env: &Env, index: i128) {
+    env.storage().instance().set(&DataKey::YieldIndex, &index);
+}
+
+fn get_user_yield_checkpoint(env: &Env, user: &Address) -> Option<accrual::UserYieldCheckpoint> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserYieldCheckpoint(user.clone()))
+}
+
+fn set_user_yield_checkpoint(env: &Env, user: &Address, checkpoint: accrual::UserYieldCheckpoint) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserYieldCheckpoint(user.clone()), &checkpoint);
+}
+
+/// Resolves the correct starting checkpoint for a user with no stored
+/// `UserYieldCheckpoint` yet — the two-cases distinction the pure `accrual`
+/// module cannot make on its own (see its module docs). A user who already
+/// held a position before the accumulator was introduced (signalled by a
+/// pre-existing `FirstDepositAt` record) is grandfathered in at
+/// `MIGRATION_LAZY_INDEX`, giving them no retroactive credit for yield
+/// reported before this feature existed but also not penalising them.
+/// A genuinely new depositor joins at the current index, so they earn
+/// nothing from yield reported before they held any shares.
+fn default_checkpoint_for(
+    env: &Env,
+    user: &Address,
+    current_index: i128,
+) -> accrual::UserYieldCheckpoint {
+    if has_first_deposit_at(env, user) {
+        accrual::UserYieldCheckpoint {
+            user_index: accrual::MIGRATION_LAZY_INDEX,
+            accrued: 0,
+        }
+    } else {
+        accrual::UserYieldCheckpoint {
+            user_index: current_index,
+            accrued: 0,
+        }
+    }
+}
+
+/// Brings `user`'s yield checkpoint up to date against the current global
+/// index and their CURRENT share balance. Must be called before any
+/// operation changes that user's share balance (deposit/withdraw/emergency
+/// exit) or resets their position (harvest), so the sync always covers the
+/// period during which the pre-change share balance was actually held.
+fn sync_user(env: &Env, user: &Address) {
+    let current_index = get_yield_index(env);
+    let shares = get_shares(env, user);
+    let checkpoint = get_user_yield_checkpoint(env, user)
+        .unwrap_or_else(|| default_checkpoint_for(env, user, current_index));
+    let result = accrual::sync(checkpoint, current_index, shares)
+        .unwrap_or_else(|e| panic_with_error!(env, e));
+    set_user_yield_checkpoint(env, user, result.checkpoint);
+    emit_event(
+        env,
+        VAULT,
+        USER_YIELD_ACCRUED,
+        user.clone(),
+        UserYieldAccruedEventData {
+            user: user.clone(),
+            accrued: result.checkpoint.accrued,
+            user_index: result.checkpoint.user_index,
+        },
+    );
+}
+
+/// Sniping-resistant per-user pending entitlement from the time-weighted
+/// accumulator — distinct from the vault-wide [`VaultContract::pending_yield`].
+/// A pure view: does not mutate the caller's checkpoint.
+fn pending_yield_for(env: &Env, user: &Address) -> i128 {
+    let current_index = get_yield_index(env);
+    let shares = get_shares(env, user);
+    let checkpoint = get_user_yield_checkpoint(env, user)
+        .unwrap_or_else(|| default_checkpoint_for(env, user, current_index));
+    accrual::pending_entitlement(checkpoint, current_index, shares)
+        .unwrap_or_else(|e| panic_with_error!(env, e))
 }
 
 fn get_total_reported_yield(env: &Env) -> i128 {
@@ -2115,6 +2236,31 @@ impl VaultContract {
         set_total_assets(&env, new_total);
         sync_vault_token_total_assets(&env);
 
+        // Time-weighted yield accumulator (issue #803): distribute this
+        // report across the index by total shares outstanding *before* this
+        // report's effect, so late depositors of THIS same transaction
+        // cannot retroactively claim it. When total_shares is zero the
+        // report is parked (index left unchanged) — there is no one to
+        // attribute it to yet.
+        let old_index = get_yield_index(&env);
+        let total_shares = vault_token_client(&env).total_supply();
+        if let Some(new_index) = accrual::apply_report(old_index, amount, total_shares)
+            .unwrap_or_else(|e| panic_with_error!(&env, e))
+        {
+            set_yield_index(&env, new_index);
+            emit_event(
+                &env,
+                VAULT,
+                YIELD_IDX_UPD,
+                caller.clone(),
+                YieldIndexUpdatedEventData {
+                    old_index,
+                    new_index,
+                    amount,
+                },
+            );
+        }
+
         // Track per-caller pending yield and aggregate reported yield for harvest.
         // Only accumulate positive yield; losses (negative amount) reduce
         // pending yield down to zero and reduce the aggregate counter.
@@ -2164,6 +2310,7 @@ impl VaultContract {
         require_active(&env);
         breaker::require_not_full_halt(&env);
         user.require_auth();
+        sync_user(&env, &user);
 
         let shares = get_shares(&env, &user);
         let redeemable = vault_token_client(&env).amount_for_shares(&shares);
@@ -3034,6 +3181,7 @@ impl VaultContract {
 
         user.require_auth();
         accrue_management_fee(&env);
+        sync_user(&env, &user);
 
         // Validate the exchange-rate state before moving funds. In particular,
         // a live share supply backed by zero assets is insolvent and must not
@@ -3195,6 +3343,7 @@ impl VaultContract {
 
         user.require_auth();
         accrue_management_fee(&env);
+        sync_user(&env, &user);
 
         let current_shares = get_shares(&env, &user);
         if shares > current_shares {
@@ -3366,6 +3515,7 @@ impl VaultContract {
         }
 
         user.require_auth();
+        sync_user(&env, &user);
 
         let principal = get_user_principal(&env, &user);
         if principal <= 0 {
@@ -3915,6 +4065,16 @@ impl VaultContract {
         gross.saturating_sub(accrued_fees)
     }
 
+    /// Sniping-resistant, per-user pending entitlement from the
+    /// time-weighted yield accumulator (issue #803) — a read-only
+    /// projection that does not mutate the caller's checkpoint. Distinct
+    /// from [`Self::pending_yield`], which reports the vault-wide
+    /// distributable surplus with no per-user attribution.
+    pub fn pending_yield_for_user(env: Env, user: Address) -> i128 {
+        require_initialized(&env);
+        pending_yield_for(&env, &user)
+    }
+
     pub fn withdrawal_fee_preview(env: Env, user: Address, shares: i128) -> WithdrawalFeePreview {
         require_initialized(&env);
         let current_shares = get_shares(&env, &user);
@@ -4083,7 +4243,6 @@ impl VaultContract {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests

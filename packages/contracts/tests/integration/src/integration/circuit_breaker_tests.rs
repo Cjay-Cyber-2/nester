@@ -84,7 +84,10 @@ fn test_deposits_succeed_after_a_reverted_circuit_breaker_trip() {
     h.vault().deposit(&user, &DEPOSIT, &0);
 
     let result = h.vault().try_withdraw(&user, &(DEPOSIT * 3 / 10), &0);
-    assert!(result.is_ok(), "30% withdrawal should complete and only escalate severity");
+    assert!(
+        result.is_ok(),
+        "30% withdrawal should complete and only escalate severity"
+    );
     assert_eq!(h.vault().get_breaker_status().severity, Severity::Throttled);
 
     assert!(!h.vault().is_paused());

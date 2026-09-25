@@ -58,6 +58,30 @@ Emitted when the vault is unpaused.
 - **Topics**: `(VAULT, UNPAUSE, admin: Address)`
 - **Data**: `{ timestamp: u64 }`
 
+### YLD_IDX (yield_index_updated) — issue #803
+Emitted by `report_yield` whenever it moves the time-weighted yield accumulator's global index (a positive `amount` distributed across current total shares; a negative `amount` is an impairment). Not emitted when `total_shares` is zero — the report is parked with the index left unchanged, since there is no one yet to attribute it to.
+- **Topics**: `(VAULT, YLD_IDX, caller: Address)`
+- **Data**:
+    ```rust
+    {
+        old_index: i128,  // index before this report (scale 1e18 = 1.0)
+        new_index: i128,  // index after this report
+        amount: i128      // the reported amount (can be negative)
+    }
+    ```
+
+### USR_ACCR (user_yield_accrued) — issue #803
+Emitted by `sync_user`, called at the top of `deposit`, `withdraw`, `harvest`, and `emergency_withdraw` — every path that is about to change a user's share balance or reset their position. Brings the user's yield checkpoint up to date against the global index and their pre-change share balance, so entitlement already earned survives the balance change that follows. This is the sniping-resistant, per-user accounting layer described in `vault/src/accrual.rs`; it is additive and does not (yet) change what `harvest`/`withdraw` actually pay out — see `pending_yield_for_user` for its own read-only view.
+- **Topics**: `(VAULT, USR_ACCR, user: Address)`
+- **Data**:
+    ```rust
+    {
+        user: Address,
+        accrued: i128,     // user's total unclaimed entitlement after this sync
+        user_index: i128   // global index the checkpoint now points at
+    }
+    ```
+
 ## Yield Registry Events (Contract Symbol: `REGISTRY`)
 
 ### SOURCE_ADDED

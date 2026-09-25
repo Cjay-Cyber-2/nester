@@ -1734,7 +1734,10 @@ fn performance_fee_does_not_dilute_passive_holders() {
     let passive_value_after = vault.get_balance(&passive_holder);
     let treasury_after = token::Client::new(&env, &token.address).balance(&treasury);
 
-    assert!(result.performance_fee > 0, "the regression must exercise a fee");
+    assert!(
+        result.performance_fee > 0,
+        "the regression must exercise a fee"
+    );
     assert!(
         share_price_after >= share_price_before,
         "one user's performance fee must not lower the exchange rate"
@@ -2767,4 +2770,3 @@ mod proptests {
         }
     }
 }
-

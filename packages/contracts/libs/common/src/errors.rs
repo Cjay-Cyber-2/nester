@@ -50,13 +50,13 @@ pub enum ContractError {
     SchemaVersionMismatch = 45,
     // --- #808: Recurring Deposit Mandate errors ---
     // MandateNotFound -> reuse StrategyNotFound (6)
-    // MandateInactive -> reuse InvalidOperation (9) 
+    // MandateInactive -> reuse InvalidOperation (9)
     // MandatePaused -> reuse InvalidOperation (9)
     // MandateNotDue -> reuse TimelockNotReady (12)
     // MandateExpired -> reuse TimelockExpired (13)
     // MandateExhausted -> reuse BudgetExhausted (36)
     // --- #804: Multi-Asset Vault errors ---
-    // PriceStale -> reuse TimelockExpired (13) 
+    // PriceStale -> reuse TimelockExpired (13)
     // PriceUnavailable -> reuse StrategyNotFound (6)
     // AssetNotInBasket -> reuse StrategyNotFound (6)
     // PriceDeviationExceeded -> reuse SlippageExceeded (17)
