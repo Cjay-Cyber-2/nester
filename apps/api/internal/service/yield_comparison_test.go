@@ -2,7 +2,11 @@ package service
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestGetYieldComparison_AggregatesMultiPoolProtocolsByTVLWeight pins the
@@ -172,5 +176,111 @@ func TestGetYieldComparison_RiskTierIsDerivedFromScore(t *testing.T) {
 	}
 	if entry.RiskTier != RiskTierHigh {
 		t.Errorf("risk_tier = %q, want high for this fixture", entry.RiskTier)
+	}
+}
+
+// TestGetYieldComparison_AggregatesFullPoolSetBeforeLimit pins the fix for a
+// bug where the requested comparison `limit` was passed straight through to
+// pool retrieval, truncating the *raw* pool list (sorted by risk-adjusted
+// APY, not by protocol) before aggregation. A multi-pool protocol whose
+// individual pools straddled that raw cutoff had some of its pools silently
+// dropped, understating its aggregated TVL and APY.
+//
+// Here "blend" has 3 pools that rank 5th-7th individually by APY, behind 4
+// single-pool protocols. With limit=5, the old pool-level truncation kept
+// only blend's top pool (dropping the other two), while the fix fetches
+// every eligible pool, aggregates first, and applies the limit to the
+// resulting protocol list.
+func TestGetYieldComparison_AggregatesFullPoolSetBeforeLimit(t *testing.T) {
+	payload := `{"status":"success","data":[
+		{"pool":"p1","project":"p1","symbol":"P1","apy":50.0,"tvlUsd":100000,"chain":"Stellar"},
+		{"pool":"p2","project":"p2","symbol":"P2","apy":45.0,"tvlUsd":100000,"chain":"Stellar"},
+		{"pool":"p3","project":"p3","symbol":"P3","apy":40.0,"tvlUsd":100000,"chain":"Stellar"},
+		{"pool":"p4","project":"p4","symbol":"P4","apy":35.0,"tvlUsd":100000,"chain":"Stellar"},
+		{"pool":"blend1","project":"blend","symbol":"USDC","apy":30.0,"tvlUsd":1000000,"chain":"Stellar"},
+		{"pool":"blend2","project":"blend","symbol":"XLM","apy":28.0,"tvlUsd":1000000,"chain":"Stellar"},
+		{"pool":"blend3","project":"blend","symbol":"AQUA","apy":25.0,"tvlUsd":1000000,"chain":"Stellar"}
+	]}`
+	ts := newMockDeFiLlamaServer(t, http.StatusOK, payload, nil)
+	defer ts.Close()
+
+	svc := NewYieldService(ts.URL)
+	got, err := svc.GetYieldComparison(context.Background(), "Stellar", 5)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got.Protocols) != 5 {
+		t.Fatalf("got %d protocols, want 5 (p1-p4 plus blend): %+v", len(got.Protocols), got.Protocols)
+	}
+
+	var blend *YieldComparisonEntry
+	for i := range got.Protocols {
+		if got.Protocols[i].Protocol == "blend" {
+			blend = &got.Protocols[i]
+		}
+	}
+	if blend == nil {
+		t.Fatalf("expected blend to survive aggregation, got %+v", got.Protocols)
+	}
+
+	wantBlendTVL := 3_000_000.0
+	if blend.TVLUSD != wantBlendTVL {
+		t.Errorf("blend tvl_usd = %v, want %v (all 3 pools, not just the top-ranked one)", blend.TVLUSD, wantBlendTVL)
+	}
+	wantBlendAPY := (30.0 + 28.0 + 25.0) / 3.0
+	if diff := blend.CurrentAPY - wantBlendAPY; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("blend current_apy = %v, want %v (weighted across all 3 pools)", blend.CurrentAPY, wantBlendAPY)
+	}
+}
+
+// TestGetYieldComparison_PropagatesFreshnessMetadata pins the fix carrying
+// the opportunity service's freshness metadata through to the comparison
+// response, so a caller can distinguish a comparison served from stale cache
+// (after an upstream failure) from an ordinary successful one.
+func TestGetYieldComparison_PropagatesFreshnessMetadata(t *testing.T) {
+	payload := `{"status":"success","data":[{"pool":"p1","project":"blend","symbol":"USDC","apy":6.0,"tvlUsd":500000,"chain":"Stellar"}]}`
+
+	var upstreamHealthy atomic.Bool
+	upstreamHealthy.Store(true)
+	var hits int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		if !upstreamHealthy.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer ts.Close()
+
+	svc := NewYieldService(ts.URL)
+	// Force the fresh-cache entry to be immediately expired (but still within
+	// the stale-cache window) so the second call is forced to hit upstream
+	// and fall back to stale data, without waiting on a real clock.
+	svc.cacheTTL = time.Nanosecond
+
+	fresh, err := svc.GetYieldComparison(context.Background(), "Stellar", 100)
+	if err != nil {
+		t.Fatalf("unexpected error priming the cache: %v", err)
+	}
+	if fresh.Meta.Stale {
+		t.Errorf("expected a fresh comparison to report meta.stale=false, got %+v", fresh.Meta)
+	}
+
+	upstreamHealthy.Store(false)
+	stale, err := svc.GetYieldComparison(context.Background(), "Stellar", 100)
+	if err != nil {
+		t.Fatalf("expected the stale-cache fallback to succeed, got error: %v", err)
+	}
+	if !stale.Meta.Stale {
+		t.Errorf("expected meta.stale=true once upstream fails and the fallback serves cached pools, got %+v", stale.Meta)
+	}
+	if stale.Meta.FetchedAt == "" {
+		t.Errorf("expected meta.fetched_at to be set on a stale response, got %+v", stale.Meta)
+	}
+	if len(stale.Protocols) != 1 || stale.Protocols[0].Protocol != "blend" {
+		t.Errorf("expected the stale cached protocol data to survive the fallback, got %+v", stale.Protocols)
 	}
 }

@@ -121,7 +121,10 @@ func (h *YieldHandler) compareAll(w http.ResponseWriter, r *http.Request) {
 
 	response.WriteJSON(w, http.StatusOK, response.Response{
 		Success: true,
-		Data:    map[string]interface{}{"data": comparison.Protocols},
+		Data: map[string]interface{}{
+			"data": comparison.Protocols,
+			"meta": comparison.Meta,
+		},
 	})
 }
 
