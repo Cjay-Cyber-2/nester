@@ -1,4 +1,4 @@
-.PHONY: fmt fmt-check clippy build test test-short integration-test clean dev dev-external dev-down dev-reset dev-logs dev-db go-test go-test-short
+.PHONY: fmt fmt-check clippy build test test-short integration-test clean dev dev-external dev-down dev-reset dev-logs dev-db go-test go-test-short db-backup db-restore db-restore-drill
 
 CARGO := cargo
 CONTRACTS_DIR := packages/contracts
@@ -72,3 +72,30 @@ dev-db-reset: ## Recreate the dev schema, re-run migrations, and re-seed
 	@echo "Waiting for migrations to apply..."
 	@until docker compose exec -T postgres psql -tA -U nester nester_dev -c "SELECT to_regclass('public.users')" | grep -q users; do sleep 1; done
 	$(MAKE) dev-seed
+
+# Backup / restore (nester#795). See docs/database-backup-restore.md for the
+# full runbook, retention/PITR guidance, and the restore-drill checklist.
+
+db-backup: ## Back up the dev database to ./backups/nester_<timestamp>.dump
+	DATABASE_DSN="postgres://nester:nester_dev_password@localhost:5432/nester_dev?sslmode=disable" \
+		scripts/db-backup.sh
+
+db-restore: ## Restore a backup: make db-restore FILE=./backups/nester_<timestamp>.dump
+	@if [ -z "$(FILE)" ]; then \
+		echo "Usage: make db-restore FILE=./backups/nester_<timestamp>.dump"; \
+		exit 1; \
+	fi
+	DATABASE_DSN="postgres://nester:nester_dev_password@localhost:5432/nester_dev?sslmode=disable" \
+		scripts/db-restore.sh "$(FILE)"
+
+db-restore-drill: ## Restore the most recent local backup into a scratch DB (nester_restore_drill) without touching nester_dev
+	@latest="$$(find ./backups -maxdepth 1 -name 'nester_*.dump' 2>/dev/null | sort | tail -1)"; \
+	if [ -z "$$latest" ]; then \
+		echo "No backups found in ./backups — run 'make db-backup' first."; \
+		exit 1; \
+	fi; \
+	echo "Restoring $$latest into scratch database nester_restore_drill ..."; \
+	docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U nester -d postgres -c "DROP DATABASE IF EXISTS nester_restore_drill;"; \
+	docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U nester -d postgres -c "CREATE DATABASE nester_restore_drill;"; \
+	DATABASE_DSN="postgres://nester:nester_dev_password@localhost:5432/nester_restore_drill?sslmode=disable" \
+		scripts/db-restore.sh "$$latest" "postgres://nester:nester_dev_password@localhost:5432/nester_restore_drill?sslmode=disable"
