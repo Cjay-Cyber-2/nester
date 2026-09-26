@@ -487,6 +487,11 @@ func Load() (*Config, error) {
 			enabled:       loader.boolDefault("REBALANCER_ENABLED", true),
 			interval:      time.Duration(loader.intDefault("REBALANCER_INTERVAL_MINUTES", 15)) * time.Minute,
 			minAPYGainBPS: int64(loader.intDefault("REBALANCER_MIN_APY_GAIN_BPS", 50)),
+			// Default 200 BPS (2%) per issue #613's requirement. Expressed
+			// in basis points (rather than a "2.0" percent literal) to match
+			// the existing minAPYGainBPS/ExpectedGainBPS convention used
+			// throughout the scheduler package.
+			apyDriftThresholdBPS: int64(loader.intDefault("REBALANCE_APY_THRESHOLD", 200)),
 		},
 		schedulerLeadership: SchedulerLeadershipConfig{
 			lockKey:           int64(loader.intDefault("SCHEDULER_LEADER_LOCK_KEY", 846000)),
@@ -865,12 +870,27 @@ type RebalancerConfig struct {
 	enabled       bool
 	interval      time.Duration
 	minAPYGainBPS int64
+	// apyDriftThresholdBPS is the APY-drift trigger threshold, in basis
+	// points, for the APYDriftDetector (#613): when the spread between a
+	// vault's current weighted APY and the best available protocol's APY
+	// exceeds this, a rebalance is automatically enqueued. Deliberately a
+	// separate knob from minAPYGainBPS above — that one gates the older
+	// #372 in-process evaluate-and-submit loop, this one gates the drift
+	// detector's enqueue-a-job path — so operators can tune "how often we
+	// look for a better allocation" independently of "how big a drift is
+	// worth enqueueing a rebalance for".
+	apyDriftThresholdBPS int64
 }
 
 func (c Config) Rebalancer() RebalancerConfig      { return c.rebalancer }
 func (r RebalancerConfig) Enabled() bool           { return r.enabled }
 func (r RebalancerConfig) Interval() time.Duration { return r.interval }
 func (r RebalancerConfig) MinAPYGainBPS() int64    { return r.minAPYGainBPS }
+
+// APYDriftThresholdBPS returns the configured drift-trigger threshold in
+// basis points (REBALANCE_APY_THRESHOLD, default 200 = 2%), used by the
+// APYDriftDetector (#613).
+func (r RebalancerConfig) APYDriftThresholdBPS() int64 { return r.apyDriftThresholdBPS }
 
 // SchedulerLeadershipConfig governs the Postgres-advisory-lock leader
 // election that gates all five scheduler background job loops (#846). See

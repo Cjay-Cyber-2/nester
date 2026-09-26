@@ -889,11 +889,6 @@ func run() error {
 	riskHandler := handler.NewRiskHandler(riskService)
 	riskHandler.Register(mux)
 
-	// Vault analytics (APY volatility, Sharpe, Sortino, drawdown, win rate)
-	vaultAnalyticsSvc := service.NewVaultAnalyticsService(performanceRepository)
-	vaultAnalyticsHandler := handler.NewVaultAnalyticsHandler(vaultAnalyticsSvc)
-	vaultAnalyticsHandler.Register(mux)
-
 	// Yield opportunities (DeFiLlama Stellar pools)
 	yieldSvc := service.NewYieldService("")
 	yieldSvc.SetHTTPClient(appMetrics.InstrumentClient(
@@ -919,6 +914,29 @@ func run() error {
 	yieldHandler.Register(mux)
 	yieldBookmarkHandler := handler.NewYieldBookmarkHandler(yieldBookmarkSvc)
 	yieldBookmarkHandler.Register(mux)
+
+	// APY drift detector (#613): compares each vault's current allocation
+	// APY against the yield registry above and, once the durable job queue
+	// is wired in further down (SetJobEnqueuer), enqueues a rebalance job on
+	// threshold drift. Constructed here (rather than down with the job
+	// queue) so the read-only GetDriftState path is available for the vault
+	// analytics endpoint immediately; jobs is nil until SetJobEnqueuer runs,
+	// during which CheckAll safely no-ops (see NewAPYDriftDetector's doc).
+	apyDriftDetector := service.NewAPYDriftDetector(
+		vaultRepository,
+		service.NewYieldServiceRegistryAdapter(yieldSvc),
+		nil,
+		cfg.Rebalancer().APYDriftThresholdBPS(),
+		0,
+		baseLogger.WithGroup("apy-drift"),
+	)
+	apyDriftDetector.SetLeaderChecker(schedulerLeadership)
+
+	// Vault analytics (APY volatility, Sharpe, Sortino, drawdown, win rate,
+	// plus live APY-drift state from apyDriftDetector above).
+	vaultAnalyticsSvc := service.NewVaultAnalyticsService(performanceRepository)
+	vaultAnalyticsHandler := handler.NewVaultAnalyticsHandler(vaultAnalyticsSvc, apyDriftDetector)
+	vaultAnalyticsHandler.Register(mux)
 
 	// Protocol health checker — alerts users when a protocol's TVL drops >20% in 24h.
 	protocolHealthChecker := scheduler.NewProtocolHealthChecker(
@@ -1051,6 +1069,17 @@ func run() error {
 	jobQueueRepo := postgres.NewJobRepository(db)
 	jobQueueMetrics := jobqueue.NewStdMetrics()
 	jobQueueClient := jobqueue.NewClient(jobQueueRepo, jobQueueMetrics)
+
+	// APY drift detector (#613), continued from its construction above: the
+	// durable job queue it needs to actually enqueue rebalances now exists,
+	// so wire it in and start the periodic sweep. The job handler itself is
+	// registered further down, alongside jobWorker's other handlers (jobWorker
+	// isn't constructed yet at this point in main). adminService (constructed
+	// earlier) satisfies service.RebalanceTrigger directly.
+	apyDriftDetector.SetJobEnqueuer(jobQueueClient)
+	apyDriftCtx, cancelAPYDrift := context.WithCancel(context.Background())
+	defer cancelAPYDrift()
+	go apyDriftDetector.Run(apyDriftCtx)
 
 	// Outbound webhooks (#836): subscriptions with SSRF-validated targets and
 	// encrypted signing secrets; delivery goes through the durable job queue
@@ -1274,6 +1303,12 @@ func run() error {
 			scheduler.NotificationDepositNotifier{Dispatcher: notificationDispatcher},
 			baseLogger.WithGroup("recurring-deposit-handler"),
 		), 0)
+
+	// APY drift rebalance (#613): processes the jobs apyDriftDetector (above)
+	// enqueues, by driving the same admin rebalance path
+	// POST /api/v1/admin/vaults/{id}/rebalance uses.
+	jobWorker.Register(service.RebalanceDriftJobType,
+		service.NewAPYDriftRebalanceJobHandler(adminService, auditLogger, baseLogger.WithGroup("apy-drift-rebalance-handler")), 0)
 
 	// Webhook delivery (#836): one attempt per job invocation; the queue's
 	// own retry/backoff/dead-letter drives everything past that (see
