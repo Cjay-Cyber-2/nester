@@ -486,6 +486,14 @@ jobs:
       - name: Build
         run: go build ./...
 
+      # Issue #1058: the committed spec is a build artifact, not a
+      # hand-maintained document — this is the check that gives that
+      # exercise teeth. Currently covers the vault lifecycle routes only
+      # (see internal/openapi/spec.go); full endpoint coverage is follow-up
+      # work.
+      - name: Check OpenAPI spec is up to date
+        run: go run ./cmd/openapi-gen -check openapi.yaml
+
       - name: Test (unit)
         run: go test -race -timeout 120s -count=1 -short ./...
 
