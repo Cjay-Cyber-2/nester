@@ -620,6 +620,10 @@ func run() error {
 		Cache:     valuation.NewCache(30 * time.Second),
 		Notifier:  valuation.NewWSNotifier(wsHub, baseLogger.WithGroup("valuation")),
 		Logger:    baseLogger.WithGroup("valuation"),
+		// Balance staleness (nester#1109): the same indexer freshness tracker
+		// that backs the lag metrics and alert (nester#1088) so the
+		// valuation's staleness verdict can never disagree with them.
+		Freshness: indexerFreshness,
 	})
 	valuationHandler := handler.NewValuationHandler(valuationService)
 
