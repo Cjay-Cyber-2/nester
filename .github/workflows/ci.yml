@@ -518,6 +518,31 @@ jobs:
           RAPID_SEED: "29062026"
         run: go test -timeout 60s -run PropertyBased -v ./internal/domain/vault
 
+  go-vet-staticcheck:
+    name: Go vet + staticcheck (API)
+    needs: changes
+    if: needs.changes.outputs.api == 'true' || needs.changes.outputs.shared == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/api
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-go@5064d95ba18d4a9dda7c4cc67adeb03aea1a2a14 # v5.3.0
+        with:
+          go-version-file: apps/api/go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: staticcheck
+        run: staticcheck ./...
+
   contracts:
     name: Contracts (Rust)
     needs: changes
