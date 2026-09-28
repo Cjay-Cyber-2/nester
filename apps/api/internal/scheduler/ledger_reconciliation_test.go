@@ -3,80 +3,98 @@ package scheduler
 import (
 	"context"
 	"log/slog"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/ledger"
 )
 
-// Mock types for testing reconciliation job escalation
+type mockReconciliationVaultLister struct {
+	vaults []ReconcileVaultInfo
+}
+
+func (m *mockReconciliationVaultLister) ListActiveForReconciliation(ctx context.Context) ([]ReconcileVaultInfo, error) {
+	return m.vaults, nil
+}
+
 type mockLedgerRepo struct {
 	ledger.Repository
-	poolBal int64
-	sumUser int64
+	poolBalance int64
+	records     []ledger.ReconciliationRecord
 }
 
 func (m *mockLedgerRepo) GetVaultPoolBalance(ctx context.Context, vaultID uuid.UUID) (int64, error) {
-	return m.poolBal, nil
+	return m.poolBalance, nil
 }
 
 func (m *mockLedgerRepo) SumUserPositionBalances(ctx context.Context, vaultID uuid.UUID) (int64, error) {
-	return m.sumUser, nil
+	return 0, nil
 }
 
 func (m *mockLedgerRepo) CreateReconciliationRecord(ctx context.Context, rec ledger.ReconciliationRecord) error {
+	m.records = append(m.records, rec)
 	return nil
 }
 
 type mockChainReader struct {
 	ledger.ChainReader
-	onChainBal        int64
+	onChainBalance     int64
 	totalSharesPrice int64
 }
 
 func (m *mockChainReader) ReadVaultBalance(ctx context.Context, contractAddress string) (int64, error) {
-	return m.onChainBal, nil
+	return m.onChainBalance, nil
 }
 
 func (m *mockChainReader) ReadTotalSharesTimesPrice(ctx context.Context, contractAddress string) (int64, error) {
 	return m.totalSharesPrice, nil
 }
 
-type mockVaultLister struct {
-	vaults []ReconcileVaultInfo
-}
+func TestLedgerReconciliationJobMainnetDollarThresholdPaging(t *testing.T) {
+	_ = os.Setenv("STELLAR_NETWORK", "mainnet")
+	defer os.Unsetenv("STELLAR_NETWORK")
 
-func (m *mockVaultLister) ListActiveForReconciliation(ctx context.Context) ([]ReconcileVaultInfo, error) {
-	return m.vaults, nil
-}
-
-func TestLedgerReconciliationEscalationMainnet(t *testing.T) {
 	vaultID := uuid.New()
-	vaults := []ReconcileVaultInfo{
-		{ID: vaultID, ContractAddress: "CVAULT1", Currency: "USDC"},
+	vaultsLister := &mockReconciliationVaultLister{
+		vaults: []ReconcileVaultInfo{
+			{ID: vaultID, ContractAddress: "CVAULTMAINNET", Currency: "USDC"},
+		},
 	}
 
-	// Ledger pool balance 1000 USDC (10,000,000,000 stroops), on chain 800 USDC (8,000,000,000 stroops)
-	// Difference = 200 USDC (2,000,000,000 stroops), which is > $100 escalation threshold on mainnet
-	repo := &mockLedgerRepo{poolBal: 10_000_000_000, sumUser: 10_000_000_000}
-	reader := &mockChainReader{onChainBal: 8_000_000_000, totalSharesPrice: 10_000_000_000}
-	lister := &mockVaultLister{vaults: vaults}
+	ledgerRepo := &mockLedgerRepo{
+		poolBalance: 20_000_000, // 2 USDC
+	}
+
+	chainReader := &mockChainReader{
+		onChainBalance: 10_000_000, // 1 USDC (diff is 1 USDC = 10,000,000 stroops)
+	}
 
 	cfg := ledger.ReconciliationConfig{
 		Enabled:                true,
-		ToleranceStroops:       1_000_000, // 0.1 USDC
-		EscalationThresholdUSD: 100.0,     // $100 threshold
-		IsMainnet:              true,
+		Interval:               time.Minute,
+		ToleranceStroops:       1_000, // small tolerance
+		MainnetDollarThreshold: 0.5,   // threshold 0.5 USDC = 5,000,000 stroops
 	}
 
 	job := NewLedgerReconciliationJob(LedgerReconciliationDeps{
-		LedgerRepo:  repo,
-		VaultLister: lister,
-		ChainReader: reader,
-		Logger:      slog.Default(),
-		Config:      cfg,
+		LedgerRepo:  ledgerRepo,
+		VaultLister:  vaultsLister,
+		ChainReader:  chainReader,
+		Logger:       slog.Default(),
+		Config:       cfg,
 	})
 
-	// Run tick without panic
+	// Run single tick
 	job.Tick(context.Background())
+
+	if len(ledgerRepo.records) != 1 {
+		t.Fatalf("expected 1 reconciliation record, got %d", len(ledgerRepo.records))
+	}
+	
+	rec := ledgerRepo.records[0]
+	if rec.Status != "drift" {
+		t.Fatalf("expected status drift, got %s", rec.Status)
+	}
 }

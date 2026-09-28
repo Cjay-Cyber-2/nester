@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -193,31 +194,32 @@ func (j *LedgerReconciliationJob) reconcileVault(ctx context.Context, v Reconcil
 	}
 
 	if status == "drift" {
-		// Check if escalation is required (mainnet and exceeds dollar escalation threshold)
-		// 1 USDC = 10,000,000 stroops. Convert absDiff stroops to USD decimal or float.
-		diffUSD := float64(absDiff) / 10_000_000.0
-		escalate := false
-		if j.cfg.IsMainnet && j.cfg.EscalationThresholdUSD > 0 && diffUSD >= j.cfg.EscalationThresholdUSD {
-			escalate = true
+		// Check if drift exceeds mainnet dollar threshold and we are on mainnet
+		// 1 USDC = 10^7 stroops. Dollar threshold converted to stroops.
+		thresholdStroops := int64(0)
+		if j.cfg.MainnetDollarThreshold > 0 {
+			thresholdStroops = parseDecimalToStroops(decimal.NewFromFloat(j.cfg.MainnetDollarThreshold))
 		}
-
-		if escalate {
-			j.logger.Error("PAGER ESCALATION: ledger-vs-chain drift exceeds dollar threshold on MAINNET — paging on-call immediately",
+		isMainnet := isMainnetEnvironment()
+		
+		if isMainnet && thresholdStroops > 0 && absDiff > thresholdStroops {
+			// Page on-call immediately with a critical alert log that triggers pagers
+			j.logger.Error("PAGER ALERT: ledger-vs-chain drift exceeded mainnet dollar threshold!",
 				"vault_id", v.ID,
+				"contract_address", v.ContractAddress,
 				"ledger", ledgerPoolBal,
 				"on_chain", onChainBal,
 				"difference", absDiff,
-				"difference_usd", diffUSD,
-				"escalation_threshold_usd", j.cfg.EscalationThresholdUSD,
-				"tolerance", tolerance,
+				"dollar_threshold", j.cfg.MainnetDollarThreshold,
+				"environment", "mainnet",
 			)
 		} else {
+			// Raise alert — log as error
 		j.logger.Error("ledger reconciliation drift beyond tolerance — alerting, not auto-correcting",
 			"vault_id", v.ID,
 			"ledger", ledgerPoolBal,
 			"on_chain", onChainBal,
 			"difference", absDiff,
-				"difference_usd", diffUSD,
 			"tolerance", tolerance,
 		)
 		}
@@ -229,4 +231,9 @@ func (j *LedgerReconciliationJob) reconcileVault(ctx context.Context, v Reconcil
 // Helper for decimal conversion used elsewhere
 func parseDecimalToStroops(d decimal.Decimal) int64 {
 	return d.Mul(decimal.NewFromInt(10_000_000)).Round(0).IntPart()
+}
+
+func isMainnetEnvironment() bool {
+	// Check standard environment variables to determine if running on mainnet
+	return os.Getenv("STELLAR_NETWORK") == "mainnet" || os.Getenv("NESTER_ENV") == "mainnet" || os.Getenv("ENVIRONMENT") == "mainnet"
 }
