@@ -153,6 +153,10 @@ type VaultService struct {
 	// built without one (tests, tooling) behaves as it did before the switch
 	// existed. Production wires it in SetMoneyPathSwitches.
 	moneyPathSwitches MoneyPathGate
+	// depositAllowlist gates individual deposits by user ID during the
+	// mainnet controlled-rollout window (nester#1389). Optional: a nil gate
+	// allows all users.
+	depositAllowlist DepositAllowlistGate
 }
 
 // MoneyPathGate reports whether a money-path operation may proceed. Declared
@@ -174,6 +178,19 @@ func (s *VaultService) ensureMoneyPathAllowed(ctx context.Context, op moneypath.
 		return nil
 	}
 	return s.moneyPathSwitches.EnsureAllowed(ctx, op)
+}
+
+// DepositAllowlistGate controls per-user deposit access during the mainnet
+// controlled-rollout window (nester#1389). A nil gate allows everyone.
+type DepositAllowlistGate interface {
+	// EnsureDepositAllowed returns nil when userID is in the current cohort,
+	// or vault.ErrDepositNotAllowlisted when they are not.
+	EnsureDepositAllowed(ctx context.Context, userID uuid.UUID) error
+}
+
+// SetDepositAllowlist installs the deposit allowlist gate.
+func (s *VaultService) SetDepositAllowlist(gate DepositAllowlistGate) {
+	s.depositAllowlist = gate
 }
 
 // GoalYieldRouter lets VaultService honor a savings goal's per-goal
@@ -405,6 +422,15 @@ func (s *VaultService) RecordDeposit(ctx context.Context, input RecordDepositInp
 	// before the chain is touched.
 	if err := s.ensureMoneyPathAllowed(ctx, moneypath.OperationDeposit); err != nil {
 		return vault.Vault{}, err
+	}
+
+	// Mainnet deposit allowlist (nester#1389). Checked after the pause gate
+	// so a paused service rejects all users uniformly before reaching cohort
+	// logic. A nil gate allows everyone.
+	if s.depositAllowlist != nil && input.UserID != uuid.Nil {
+		if err := s.depositAllowlist.EnsureDepositAllowed(ctx, input.UserID); err != nil {
+			return vault.Vault{}, err
+		}
 	}
 
 	if input.VaultID == uuid.Nil {
