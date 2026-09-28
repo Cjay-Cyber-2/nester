@@ -1906,19 +1906,23 @@ type chainBreakerSet struct {
 //
 // Two breakers, not one: Soroban RPC and Horizon fail independently, and a
 // Horizon outage shedding Soroban traffic would take deposits offline for a
-// dependency they do not need. They share a *policy* because both degrade the
-// same way, but never state.
+// dependency they do not need. They share a *policy* by default because both
+// degrade the same way, but never state — and either one's thresholds can be
+// overridden independently via CIRCUIT_BREAKER_SOROBAN_RPC_*/
+// CIRCUIT_BREAKER_HORIZON_* (nester#1314) when an upstream's actual SLA
+// warrants different numbers.
 func newChainBreakers(cfg *config.Config, m *metrics.Metrics, logger *slog.Logger) (*chainBreakerSet, error) {
 	if !cfg.CircuitBreaker().Enabled() {
 		logger.Warn("chain circuit breakers are disabled; a degraded Soroban RPC or Horizon will not be shed")
 		return nil, nil
 	}
 
-	policy := cfg.CircuitBreaker().Policy()
+	sorobanPolicy := cfg.CircuitBreaker().SorobanRPCPolicy()
+	horizonPolicy := cfg.CircuitBreaker().HorizonPolicy()
 	onTransition := chainBreakerLogger(logger.WithGroup("circuit-breaker"))
 
-	sorobanBreaker := breaker.New(string(metrics.UpstreamSorobanRPC), policy, onTransition)
-	horizonBreaker := breaker.New(string(metrics.UpstreamHorizon), policy, onTransition)
+	sorobanBreaker := breaker.New(string(metrics.UpstreamSorobanRPC), sorobanPolicy, onTransition)
+	horizonBreaker := breaker.New(string(metrics.UpstreamHorizon), horizonPolicy, onTransition)
 
 	router := breaker.NewRouter()
 	if err := router.Register(cfg.Stellar().RPCURL(), sorobanBreaker); err != nil {
@@ -1939,10 +1943,14 @@ func newChainBreakers(cfg *config.Config, m *metrics.Metrics, logger *slog.Logge
 	}
 
 	logger.Info("chain circuit breakers enabled",
-		"failure_ratio", policy.FailureRatio,
-		"min_requests", policy.MinRequests,
-		"window", policy.Window.String(),
-		"open_duration", policy.OpenDuration.String(),
+		"soroban_rpc_failure_ratio", sorobanPolicy.FailureRatio,
+		"soroban_rpc_min_requests", sorobanPolicy.MinRequests,
+		"soroban_rpc_window", sorobanPolicy.Window.String(),
+		"soroban_rpc_open_duration", sorobanPolicy.OpenDuration.String(),
+		"horizon_failure_ratio", horizonPolicy.FailureRatio,
+		"horizon_min_requests", horizonPolicy.MinRequests,
+		"horizon_window", horizonPolicy.Window.String(),
+		"horizon_open_duration", horizonPolicy.OpenDuration.String(),
 	)
 
 	return &chainBreakerSet{router: router}, nil
