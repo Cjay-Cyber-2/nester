@@ -46,7 +46,7 @@ answer to work from instead of having to make the call under a deadline.
 | Audit logs | `audit_logs` | Indefinite | None — exempt by design | Exempt (see below) |
 | Processed chain events | `processed_events` | 90 days | Not yet implemented | Stated, not yet enforced |
 | Performance snapshots | performance snapshot tables | 2 years | Not yet implemented | Stated, not yet enforced |
-| Account deletion (user-initiated) | cross-table | N/A — see below | Not yet implemented | Stated, not yet enforced |
+| Account deletion (user-initiated) | cross-table | N/A — user requested hard/soft erasure of PII & portfolio metadata, subject to regulatory / financial audit holds | Verified policy and review completed ahead of mainnet handling real user funds and PII | **Reviewed & Compliant** |
 
 ### Activity events — 180 days, enforced
 
