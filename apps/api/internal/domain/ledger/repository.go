@@ -67,4 +67,6 @@ type ReconciliationConfig struct {
 	Enabled           bool
 	Interval          time.Duration
 	ToleranceStroops  int64 // max allowed drift before alert
+	EscalationThresholdUSD float64 // dollar threshold for immediate on-call paging on mainnet
+	IsMainnet              bool    // whether running on mainnet
 }

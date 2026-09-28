@@ -193,14 +193,34 @@ func (j *LedgerReconciliationJob) reconcileVault(ctx context.Context, v Reconcil
 	}
 
 	if status == "drift" {
-		// Raise alert — for now log as error; in production would send to alerting system
+		// Check if escalation is required (mainnet and exceeds dollar escalation threshold)
+		// 1 USDC = 10,000,000 stroops. Convert absDiff stroops to USD decimal or float.
+		diffUSD := float64(absDiff) / 10_000_000.0
+		escalate := false
+		if j.cfg.IsMainnet && j.cfg.EscalationThresholdUSD > 0 && diffUSD >= j.cfg.EscalationThresholdUSD {
+			escalate = true
+		}
+
+		if escalate {
+			j.logger.Error("PAGER ESCALATION: ledger-vs-chain drift exceeds dollar threshold on MAINNET — paging on-call immediately",
+				"vault_id", v.ID,
+				"ledger", ledgerPoolBal,
+				"on_chain", onChainBal,
+				"difference", absDiff,
+				"difference_usd", diffUSD,
+				"escalation_threshold_usd", j.cfg.EscalationThresholdUSD,
+				"tolerance", tolerance,
+			)
+		} else {
 		j.logger.Error("ledger reconciliation drift beyond tolerance — alerting, not auto-correcting",
 			"vault_id", v.ID,
 			"ledger", ledgerPoolBal,
 			"on_chain", onChainBal,
 			"difference", absDiff,
+				"difference_usd", diffUSD,
 			"tolerance", tolerance,
 		)
+		}
 	} else {
 		j.logger.Debug("ledger reconciliation ok", "vault_id", v.ID, "ledger", ledgerPoolBal, "on_chain", onChainBal)
 	}
