@@ -888,6 +888,17 @@ func run() error {
 	analyticsHandler := handler.NewAnalyticsHandler(performanceService)
 	analyticsHandler.Register(mux)
 
+	// Protocol-level yield comparison over time (#1324).
+	protocolComparisonRepo := postgres.NewAnalyticsComparisonRepository(db)
+	protocolComparisonService := service.NewProtocolComparisonService(protocolComparisonRepo)
+	protocolComparisonHandler := handler.NewProtocolComparisonHandler(protocolComparisonService)
+	protocolComparisonHandler.Register(mux)
+
+	// System-wide maintenance mode (#1328): halt or read-only, gated to admins.
+	maintenanceHandler := handler.NewMaintenanceHandler(systemStateRepository)
+	maintenanceHandler.Register(mux)
+	maintenanceGate := middleware.NewMaintenanceGate(systemStateRepository, 5*time.Second)
+
 	// Risk service
 	riskService := services.NewRiskService(vaultRepository, db)
 	riskHandler := handler.NewRiskHandler(riskService)
@@ -1201,6 +1212,10 @@ func run() error {
 	// there would only ever enqueue jobs for Email/Push that it has no
 	// adapter to actually redeliver.
 	notificationDispatcher2.SetRetryEnqueuer(notifications.NewJobQueueRetryEnqueuer(jobQueueClient))
+
+	// Dead-letter inspection and manual retry (#1329), gated to admins.
+	jobQueueAdminHandler := handler.NewJobQueueAdminHandler(jobQueueRepo)
+	jobQueueAdminHandler.Register(mux)
 
 	// Recurring deposit sweep (#846): classified SINGLETON (money-moving —
 	// see RecurringDepositJob's doc comment). The sweep loop itself only
@@ -1631,16 +1646,18 @@ func run() error {
 									authGuard(
 										writeLimiter(
 											authenticator(
-												walletBinding(
-													idempotencyMiddleware(
-														costQuota(
-															walletLimiter(
-																middleware.LimitRequestBody(1 * 1024 * 1024)(
-																	middleware.Logging(baseLogger)(
-																		middleware.Tracing(
-																			cfg.Tracing().ServiceName(),
-																			cfg.Tracing().LatencyThreshold(),
-																		)(mux),
+												maintenanceGate.Middleware(authRules)(
+													walletBinding(
+														idempotencyMiddleware(
+															costQuota(
+																walletLimiter(
+																	middleware.LimitRequestBody(1 * 1024 * 1024)(
+																		middleware.Logging(baseLogger)(
+																			middleware.Tracing(
+																				cfg.Tracing().ServiceName(),
+																				cfg.Tracing().LatencyThreshold(),
+																			)(mux),
+																		),
 																	),
 																),
 															),
