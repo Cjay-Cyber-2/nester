@@ -36,6 +36,15 @@ const (
 // DefaultMaxAttempts is used when EnqueueInput.MaxAttempts is unset (<= 0).
 const DefaultMaxAttempts = 5
 
+// Priority tiers for EnqueueInput.Priority / DequeueParams ordering
+// (`ORDER BY priority DESC`). Money-path jobs that affect a user's balance use
+// PriorityBalance so they are dequeued ahead of PriorityDefault digest and
+// notification jobs of the same type under load.
+const (
+	PriorityDefault = 0
+	PriorityBalance = 10
+)
+
 // Job is a single unit of durable work.
 type Job struct {
 	ID             uuid.UUID       `json:"id"`
