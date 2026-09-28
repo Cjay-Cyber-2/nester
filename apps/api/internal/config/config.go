@@ -69,16 +69,53 @@ type Config struct {
 // CircuitBreakerConfig is the policy protecting the chain upstreams, Soroban
 // RPC and Horizon (nester#1087).
 //
-// One policy, two independent breakers. The thresholds are shared because both
-// upstreams degrade the same way and there is no evidence for different
-// numbers; the failure *state* is strictly separate, so a Horizon outage never
-// sheds Soroban traffic. See docs/observability/circuit-breakers.md.
+// One policy, two independent breakers by default. The thresholds are shared
+// because both upstreams degrade the same way and there was no evidence for
+// different numbers; the failure *state* is strictly separate, so a Horizon
+// outage never sheds Soroban traffic. See docs/observability/circuit-breakers.md.
+//
+// sorobanRPCOverride and horizonOverride (nester#1314) let an operator diverge
+// from the shared policy for one upstream without touching the other — e.g. a
+// Soroban RPC provider with a documented lower SLA warrants a lower
+// FailureRatio than Horizon. Each field is nil unless its corresponding env
+// var is set, so the zero-config deployment keeps behaving exactly as before.
 type CircuitBreakerConfig struct {
 	enabled      bool
 	failureRatio float64
 	minRequests  int
 	window       time.Duration
 	openDuration time.Duration
+
+	sorobanRPCOverride breakerOverride
+	horizonOverride     breakerOverride
+}
+
+// breakerOverride holds per-upstream threshold overrides. A nil pointer field
+// means "use the shared policy's value for this field" — overrides are
+// independent of one another, not all-or-nothing.
+type breakerOverride struct {
+	failureRatio *float64
+	minRequests  *int
+	window       *time.Duration
+	openDuration *time.Duration
+}
+
+// Policy returns the breaker policy for this upstream: the shared policy with
+// any set override fields applied on top.
+func (o breakerOverride) apply(base breaker.Config) breaker.Config {
+	if o.failureRatio != nil {
+		base.FailureRatio = *o.failureRatio
+	}
+	if o.minRequests != nil {
+		base.MinRequests = *o.minRequests
+	}
+	if o.window != nil {
+		base.Window = *o.window
+	}
+	if o.openDuration != nil {
+		base.OpenDuration = *o.openDuration
+	}
+	return base
 }
 
 // RPCRetryConfig is the bounded, jittered retry policy shared by every Soroban
@@ -518,6 +555,21 @@ func Load() (*Config, error) {
 			minRequests:  loader.intDefault("CIRCUIT_BREAKER_MIN_REQUESTS", breaker.DefaultMinRequests),
 			window:       loader.durationDefault("CIRCUIT_BREAKER_WINDOW", breaker.DefaultWindow),
 			openDuration: loader.durationDefault("CIRCUIT_BREAKER_OPEN_DURATION", breaker.DefaultOpenDuration),
+			// Per-upstream overrides (nester#1314). Unset by default, so the
+			// shared policy above still governs both breakers unless an
+			// operator opts one of them out of it.
+			sorobanRPCOverride: breakerOverride{
+				failureRatio: loader.floatOverride("CIRCUIT_BREAKER_SOROBAN_RPC_FAILURE_RATIO"),
+				minRequests:  loader.intOverride("CIRCUIT_BREAKER_SOROBAN_RPC_MIN_REQUESTS"),
+				window:       loader.durationOverride("CIRCUIT_BREAKER_SOROBAN_RPC_WINDOW"),
+				openDuration: loader.durationOverride("CIRCUIT_BREAKER_SOROBAN_RPC_OPEN_DURATION"),
+			},
+			horizonOverride: breakerOverride{
+				failureRatio: loader.floatOverride("CIRCUIT_BREAKER_HORIZON_FAILURE_RATIO"),
+				minRequests:  loader.intOverride("CIRCUIT_BREAKER_HORIZON_MIN_REQUESTS"),
+				window:       loader.durationOverride("CIRCUIT_BREAKER_HORIZON_WINDOW"),
+				openDuration: loader.durationOverride("CIRCUIT_BREAKER_HORIZON_OPEN_DURATION"),
+			},
 		},
 		rpcRetry: RPCRetryConfig{
 			// 1 disables retrying without disabling the helper: the metrics
@@ -582,7 +634,7 @@ func (r RPCRetryConfig) Policy() retry.Policy {
 	}
 }
 
-// Policy returns the breaker policy this configuration describes.
+// Policy returns the shared breaker policy this configuration describes.
 func (b CircuitBreakerConfig) Policy() breaker.Config {
 	return breaker.Config{
 		FailureRatio: b.failureRatio,
@@ -590,6 +642,18 @@ func (b CircuitBreakerConfig) Policy() breaker.Config {
 		Window:       b.window,
 		OpenDuration: b.openDuration,
 	}
+}
+
+// SorobanRPCPolicy returns the policy for the Soroban RPC breaker: the shared
+// Policy with CIRCUIT_BREAKER_SOROBAN_RPC_* overrides applied (nester#1314).
+func (b CircuitBreakerConfig) SorobanRPCPolicy() breaker.Config {
+	return b.sorobanRPCOverride.apply(b.Policy())
+}
+
+// HorizonPolicy returns the policy for the Horizon breaker: the shared Policy
+// with CIRCUIT_BREAKER_HORIZON_* overrides applied (nester#1314).
+func (b CircuitBreakerConfig) HorizonPolicy() breaker.Config {
+	return b.horizonOverride.apply(b.Policy())
 }
 
 // StalenessBudget is how far behind the chain indexed data may fall before the
@@ -1183,6 +1247,12 @@ func (c *Config) validate(loader *envLoader) {
 		if err := c.circuitBreaker.Policy().Validate(); err != nil {
 			loader.addError("CIRCUIT_BREAKER_* configuration is invalid: " + err.Error())
 		}
+		if err := c.circuitBreaker.SorobanRPCPolicy().Validate(); err != nil {
+			loader.addError("CIRCUIT_BREAKER_SOROBAN_RPC_* configuration is invalid: " + err.Error())
+		}
+		if err := c.circuitBreaker.HorizonPolicy().Validate(); err != nil {
+			loader.addError("CIRCUIT_BREAKER_HORIZON_* configuration is invalid: " + err.Error())
+		}
 	}
 
 	// The policy owns the rules, so they are stated once rather than
@@ -1534,6 +1604,48 @@ func (l *envLoader) floatDefault(key string, fallback float64) float64 {
 		return fallback
 	}
 	return value
+}
+
+// floatOverride returns nil when key is unset, so callers can distinguish
+// "not configured" from "configured as zero" — the distinction a *Default
+// helper collapses away.
+func (l *envLoader) floatOverride(key string) *float64 {
+	raw, ok := l.lookup(key)
+	if !ok {
+		return nil
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		l.addError(fmt.Sprintf("%s must be a number, got %q", key, raw))
+		return nil
+	}
+	return &value
+}
+
+func (l *envLoader) intOverride(key string) *int {
+	raw, ok := l.lookup(key)
+	if !ok {
+		return nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		l.addError(fmt.Sprintf("%s must be an integer, got %q", key, raw))
+		return nil
+	}
+	return &value
+}
+
+func (l *envLoader) durationOverride(key string) *time.Duration {
+	raw, ok := l.lookup(key)
+	if !ok {
+		return nil
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil {
+		l.addError(fmt.Sprintf("%s must be a duration, got %q", key, raw))
+		return nil
+	}
+	return &value
 }
 
 func (l *envLoader) stringSliceDefault(key string, fallback []string) []string {
