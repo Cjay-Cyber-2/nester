@@ -58,6 +58,29 @@ Emitted when the vault is unpaused.
 - **Topics**: `(VAULT, UNPAUSE, admin: Address)`
 - **Data**: `{ timestamp: u64 }`
 
+### YLD_STRT (yield_stream_started) — issue #803
+Emitted by `report_yield` whenever a positive `amount` starts (or extends) a linear vesting stream. Not applied to `TotalAssets` all at once: instead it vests over `total` divided across `ends_at - started_at`, closing the sniping hole where a deposit made immediately before a report could capture a full instant share-price jump. If a prior stream was still active, its unreleased remainder is folded into `total` rather than discarded or double-counted. Not emitted for a negative `amount` (an impairment), which still applies to `TotalAssets` immediately — see `YLD_RLSD`'s note on why.
+- **Topics**: `(VAULT, YLD_STRT, contract_address: Address)`
+- **Data**:
+    ```rust
+    {
+        total: i128,      // total amount now vesting over this stream's window
+        started_at: u64,  // ledger timestamp the stream started at
+        ends_at: u64       // ledger timestamp the stream fully vests by
+    }
+    ```
+
+### YLD_RLSD (yield_released) — issue #803
+Emitted whenever `release_vested_yield` moves a newly-vested portion of the active stream into `TotalAssets`. Runs at the top of every operation that reads `TotalAssets`/share price in a way that matters for fairness between holders — `deposit`, `withdraw`, `harvest`, and `report_yield` itself — so no caller can ever observe a share price that omits yield which has already, in real time, finished vesting. A no-op (and no event) when there is no active stream or nothing has vested since the last release.
+- **Topics**: `(VAULT, YLD_RLSD, contract_address: Address)`
+- **Data**:
+    ```rust
+    {
+        released: i128,   // amount moved into TotalAssets this call
+        remaining: i128   // amount still left to vest in the active stream
+    }
+    ```
+
 ## Yield Registry Events (Contract Symbol: `REGISTRY`)
 
 ### SOURCE_ADDED
@@ -86,6 +109,51 @@ Emitted when a yield source status is updated.
 Emitted when a yield source is removed.
 - **Topics**: `(REGISTRY, SOURCE_REMOVED, source_id: Symbol)`
 - **Data**: `{}`
+
+### VAL_ATT (value_attested)
+Emitted on every accepted attested APY or TVL update (via `update_apy_attested` or
+`update_tvl_attested`).  This event is the primary post-hoc audit record: given the
+full event log anyone can re-verify that each accepted value was signed by the parties
+the registry trusted at that moment.
+
+- **Topics**: `(REGISTRY, VAL_ATT, source_id: Symbol)`
+- **Data**:
+    ```rust
+    {
+        source_id: Symbol,
+        /// 0x01 = APY, 0x02 = TVL
+        field_tag: u32,
+        /// Accepted value — apy_bps cast to i128 for APY; tvl for TVL
+        value: i128,
+        /// ed25519 public keys (BytesN<32>) of all attesters whose
+        /// signatures were counted toward the threshold
+        attester_keys: Vec<BytesN<32>>,
+        /// Nonces used by each attester (parallel array with attester_keys)
+        nonces: Vec<u64>,
+        /// Ledger timestamp at which the update was accepted
+        accepted_at: u64,
+    }
+    ```
+
+**Canonical payload encoding** (what attesters sign):
+
+| Offset | Length | Field |
+|--------|--------|-------|
+| 0 | 32 | `contract_address` — last 32 bytes of the Soroban `ScAddress` XDR |
+| 32 | 4 | `source_id_len` — big-endian u32, byte length of the symbol string |
+| 36 | N | `source_id` — UTF-8 bytes of the Symbol (N ≤ 9 for `symbol_short!`) |
+| 36+N | 1 | `field_tag` — `0x01` (APY) or `0x02` (TVL) |
+| 37+N | 4 | `value_u32` — big-endian u32 `apy_bps` (APY path); `0` for TVL |
+| 41+N | 16 | `value_i128` — big-endian i128 `tvl` (TVL path); `0` for APY |
+| 57+N | 8 | `valid_from` — big-endian u64 Unix timestamp, inclusive |
+| 65+N | 8 | `valid_until` — big-endian u64 Unix timestamp, exclusive |
+| 73+N | 8 | `nonce` — big-endian u64, must exceed last-seen nonce per attester |
+
+Total payload length: **81 + N bytes**.
+
+Including the contract address in the payload means a signature for testnet
+cannot be replayed on mainnet.  The nonce and validity window together prevent
+capture-and-replay attacks against a running network.
 
 ## Allocation Strategy Events (Contract Symbol: `STRATEGY`)
 
@@ -129,6 +197,90 @@ Emitted when an admin transfer is completed.
 - **Topics**: `(ACCESS, ADMIN_TRANSFER, new_admin: Address)`
 - **Data**: `{ old_admin: Address }`
 
+### RL_XFR_P (role_transfer_proposed)
+Emitted when a generalised two-step role transfer is proposed (issue #820) — the same one-move-mistake protection as `ADMIN_TRANSFER`, extended to every role.
+- **Topics**: `(ACCESS, RL_XFR_P, new_holder: Address)`
+- **Data**: `{ role: Role, from: Address, to: Address }`
+
+### RL_XFR_A (role_accepted)
+Emitted when the proposed successor accepts a pending role transfer.
+- **Topics**: `(ACCESS, RL_XFR_A, new_holder: Address)`
+- **Data**: `{ role: Role, from: Address, to: Address }`
+
+### RL_XFR_C (role transfer cancelled)
+Emitted when the proposer cancels a pending role transfer before it is accepted.
+- **Topics**: `(ACCESS, RL_XFR_C, proposer: Address)`
+- **Data**: `{ role: Role, from: Address, to: Address }`
+
+### RL_EXP (role_expired)
+Emitted the first time `has_role` observes that a time-bounded grant (via `grant_role_until`) has passed its expiry. The flag is cleared and the address is removed from `get_role_members` at the same time.
+- **Topics**: `(ACCESS, RL_EXP, account: Address)`
+- **Data**: `{ role: Role, actor: Address }`
+
+## Circuit Breaker Events (Contract Symbol: `BREAKER`, emitted by the vault — issue #817)
+
+### BRK_TRIP (breaker_tripped)
+Emitted every time a trip condition fires, whether or not it actually raises severity further (so the latest firing condition is always visible even while already at a higher severity).
+- **Topics**: `(BREAKER, BRK_TRIP, vault_address: Address)`
+- **Data**:
+    ```rust
+    {
+        reason: TripReason,      // SharePriceMove | YieldSanity | WithdrawVelocity | SourceFailure | GuardianManual
+        observed: i128,
+        threshold: i128,
+        severity: Severity       // Normal | Throttled | DepositsHalted | FullHalt
+    }
+    ```
+
+### SEV_CHG (severity_changed)
+Emitted whenever severity actually transitions, in either direction (automatic escalation or staged recovery).
+- **Topics**: `(BREAKER, SEV_CHG, vault_address: Address)`
+- **Data**: `(from: Severity, to: Severity)`
+
+### BRK_RCVR (breaker_recovered)
+Emitted on each staged recovery step (`recover_next_stage`), recording who authorised it.
+- **Topics**: `(BREAKER, BRK_RCVR, authorised_by: Address)`
+- **Data**: `{ from: Severity, to: Severity, authorised_by: Address }`
+
+## Vault Factory Events (Contract Symbol: `FACTORY` — issue #816)
+
+### VLT_NEW (vault created)
+Emitted when `create_vault` successfully deploys and initialises a new vault.
+- **Topics**: `(FACTORY, VLT_NEW, vault_address: Address)`
+- **Data**: `{ salt: BytesN<32>, address: Address, wasm_hash: BytesN<32> }`
+
+### VLT_DEP (vault deprecated)
+Emitted when `deprecate_vault` marks a registry entry as no longer recommended.
+- **Topics**: `(FACTORY, VLT_DEP, vault_address: Address)`
+- **Data**: `{}`
+
+### WASM_SET (wasm hash applied)
+Emitted when a timelocked WASM-hash change is applied via `apply_wasm_hash`.
+- **Topics**: `(FACTORY, WASM_SET, caller: Address)`
+- **Data**: `new_hash: BytesN<32>`
+
+## Referral Events (Contract Symbol: `REFERRAL` — issue #818)
+
+### REF_REG (referral_registered)
+Emitted when a referral relationship is bound via `register_referral`.
+- **Topics**: `(REFERRAL, REF_REG, user: Address)`
+- **Data**: `referrer: Address`
+
+### REF_ACCR (referral_reward_accrued)
+Emitted whenever a reward is credited to a referrer's claimable balance.
+- **Topics**: `(REFERRAL, REF_ACCR, referrer: Address)`
+- **Data**: `(referred_user: Address, reward: i128)`
+
+### REF_CLAIM (referral_reward_claimed)
+Emitted when a referrer claims their accrued balance.
+- **Topics**: `(REFERRAL, REF_CLAIM, referrer: Address)`
+- **Data**: `amount: i128`
+
+### REF_BGT_X (referral_budget_exhausted)
+Emitted once the global program budget reaches zero.
+- **Topics**: `(REFERRAL, REF_BGT_X, referrer: Address)`
+- **Data**: `remaining_budget: i128` (always `0`)
+
 ## Timelock Events (Contract Symbol: `TIMELOCK`)
 
 ### PROPOSE
@@ -162,5 +314,192 @@ Emitted when a timelocked operation is cancelled.
     {
         op_type: Symbol,
         cancelled_by: Address
+    }
+    ```
+
+---
+
+## Yield Adapters (#812)
+
+### SRC_FAIL
+Emitted by the registry each time an adapter interaction fails. Fires on every
+failure, including ones below the degradation threshold.
+- **Topics**: `(REGISTRY, SRC_FAIL, source_id: Symbol)`
+- **Data**:
+    ```rust
+    {
+        failure_count: u32,   // consecutive failures including this one
+        threshold: u32,       // failures tolerated before degradation
+        reporter: Address     // registry itself, or the vault
+    }
+    ```
+
+### SRC_DEGR
+Emitted once when consecutive failures exceed the threshold and the source is
+flipped to `SourceStatus::Degraded`. Allocation logic then freezes the source's
+existing allocation. Recovery is never automatic.
+- **Topics**: `(REGISTRY, SRC_DEGR, source_id: Symbol)`
+- **Data**:
+    ```rust
+    {
+        failure_count: u32,
+        previous_status: SourceStatus,
+        degraded_at: u64
+    }
+    ```
+
+### SRC_RECO
+Emitted when an admin explicitly returns a degraded source to `Active` via
+`recover_source`.
+- **Topics**: `(REGISTRY, SRC_RECO, source_id: Symbol)`
+- **Data**:
+    ```rust
+    {
+        recovered_by: Address,
+        recovered_at: u64
+    }
+    ```
+
+### SRC_SKIP
+Emitted by the vault when a rebalance skips a source because its adapter
+failed, or when `record_source_allocation` refuses an unhealthy source. The
+rebalance continues across the remaining sources.
+- **Topics**: `(VAULT, SRC_SKIP, source_id: Symbol)`
+- **Data**:
+    ```rust
+    {
+        attempted_delta: i128,
+        timestamp: u64
+    }
+    ```
+
+### ADAPTER DEPOSIT / WITHDRAW
+Emitted by each adapter when value moves through it.
+- **Topics**: `(ADAPTER, DEPOSIT | WITHDRAW, counterparty: Address)`
+- **Data**:
+    ```rust
+    {
+        amount: i128,   // underlying assets in/out
+        units: i128     // protocol position units minted/burned
+    }
+    ```
+## Savings Goal Events (Contract Symbol: `SAV_GOAL` — issue #807)
+
+### GOAL_NEW (goal_created)
+Emitted when `create_goal` registers a new on-chain goal.
+- **Topics**: `(SAV_GOAL, GOAL_NEW, goal_id: BytesN<32>)`
+- **Data**: `{ owner: Address, vault: Address, target_amount: i128, deadline: u64 }`
+
+### GOAL_MS (goal_milestone_reached)
+Emitted the first time `contribute` observes `contributed` crossing a 25/50/75/100% threshold. The goal's milestone bitmask makes this idempotent — a threshold can never be attested twice, even across retried calls.
+- **Topics**: `(SAV_GOAL, GOAL_MS, goal_id: BytesN<32>)`
+- **Data**: `{ threshold_pct: u32, contributed: i128, timestamp: u64 }`
+
+### GOAL_CMP (goal_completed)
+Emitted when a goal's `contributed` reaches its `target_amount`, either inline during `contribute` or via the permissionless `finalize_goal`.
+- **Topics**: `(SAV_GOAL, GOAL_CMP, goal_id: BytesN<32>)`
+- **Data**: `{ contributed: i128, timestamp: u64 }`
+
+### GOAL_EXP (goal_expired)
+Emitted when the permissionless `expire_goal` transitions a goal past its deadline without completion.
+- **Topics**: `(SAV_GOAL, GOAL_EXP, goal_id: BytesN<32>)`
+- **Data**: `{ contributed: i128, timestamp: u64 }`
+
+### GOAL_AB (goal_abandoned)
+Emitted when the goal owner calls `abandon_goal`.
+- **Topics**: `(SAV_GOAL, GOAL_AB, goal_id: BytesN<32>)`
+- **Data**: `{ contributed: i128, timestamp: u64 }`
+
+## Upgrade Events (Contract Symbol: `UPGRADE`)
+
+### PROP_UPG (upgrade_proposed)
+Emitted when a new contract WASM upgrade is proposed with a timelock ETA.
+- **Topics**: `(UPGRADE, PROP_UPG, proposer: Address)`
+- **Data**:
+    ```rust
+    {
+        wasm_hash: BytesN<32>,
+        eta: u64,
+        proposer: Address
+    }
+    ```
+
+### CAN_UPG (upgrade_cancelled)
+Emitted when a pending WASM upgrade proposal is cancelled before execution.
+- **Topics**: `(UPGRADE, CAN_UPG, cancelled_by: Address)`
+- **Data**:
+    ```rust
+    {
+        wasm_hash: BytesN<32>,
+        cancelled_by: Address
+    }
+    ```
+
+### EXEC_UPG (upgrade_executed)
+Emitted when a matured WASM upgrade is executed, updating the contract WASM.
+- **Topics**: `(UPGRADE, EXEC_UPG, executed_by: Address)`
+- **Data**:
+    ```rust
+    {
+        wasm_hash: BytesN<32>,
+        executed_by: Address,
+        execution_timestamp: u64
+    }
+    ```
+
+## Recurring Deposit Events (Contract Symbol: `MANDATE`)
+
+### MDT_CRTD (mandate_created)
+Emitted when a user creates a new recurring deposit authorization mandate.
+- **Topics**: `(MANDATE, MDT_CRTD, user: Address)`
+- **Data**:
+    ```rust
+    {
+        mandate_id: u64,
+        user: Address,
+        vault: Address,
+        token: Address,
+        amount_per_period: i128,
+        period_secs: u64,
+        expires_at: u64,
+        max_total: i128
+    }
+    ```
+
+### MDT_EXEC (mandate_executed)
+Emitted when a mandate execution is triggered.
+- **Topics**: `(MANDATE, MDT_EXEC, user: Address)`
+- **Data**:
+    ```rust
+    {
+        mandate_id: u64,
+        user: Address,
+        vault: Address,
+        amount: i128,
+        total_drawn: i128,
+        executor: Address
+    }
+    ```
+
+### MDT_CANC (mandate_cancelled)
+Emitted when a mandate is cancelled by its owner.
+- **Topics**: `(MANDATE, MDT_CANC, user: Address)`
+- **Data**:
+    ```rust
+    {
+        mandate_id: u64,
+        user: Address
+    }
+    ```
+
+### MDT_PAUSE (mandate_paused)
+Emitted when a mandate is paused or resumed.
+- **Topics**: `(MANDATE, MDT_PAUSE, user: Address)`
+- **Data**:
+    ```rust
+    {
+        mandate_id: u64,
+        user: Address,
+        paused: bool
     }
     ```

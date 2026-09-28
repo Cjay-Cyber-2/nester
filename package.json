@@ -7,11 +7,18 @@
     "build": "turbo run build",
     "lint": "turbo run lint",
     "website": "turbo run dev --filter=@nester/website",
-    "dapp": "turbo run dev --filter=@nester/dapp",
-    "intelligence": "turbo run dev --filter=@nester/intelligence"
+    "dapp": "turbo run dev --filter=@nester/dapp"
   },
   "devDependencies": {
     "turbo": "^2.3.3"
   },
-  "packageManager": "pnpm@9.15.0"
+  "packageManager": "pnpm@9.15.0",
+  "pnpm": {
+    "overrides": {
+      "protobufjs@<7.5.5": ">=7.5.5",
+      "shell-quote@<1.8.4": ">=1.8.4",
+      "tar@<7.5.19": ">=7.5.19",
+      "next-auth@<4.24.15": ">=4.24.15"
+    }
+  }
 }

@@ -23,12 +23,14 @@ type Claims struct {
 	WalletAddress string   `json:"wallet,omitempty"`
 	Scopes        []string `json:"scopes,omitempty"`
 	Roles         []string `json:"roles,omitempty"`
-	ExpiresAt     int64    `json:"exp,omitempty"`
-	IssuedAt      int64    `json:"iat,omitempty"`
-	// SessionID identifies the sessions row this token was issued for, so the
-	// revocation-list check (#1327) can reject it immediately once that row's
-	// revoked_at is set, instead of waiting for natural token expiry.
-	SessionID string `json:"sid,omitempty"`
+	SessionID     string   `json:"sid,omitempty"`
+	// TokenID uniquely identifies this access-token mint (distinct from
+	// SessionID, which stays stable across rotations). Without it, two
+	// tokens minted within the same wall-clock second for the same session
+	// carry byte-identical claims and would be identical strings.
+	TokenID   string `json:"jti,omitempty"`
+	ExpiresAt int64  `json:"exp,omitempty"`
+	IssuedAt  int64  `json:"iat,omitempty"`
 }
 
 // ParseJWT validates an HS256 Bearer token signed with secret and returns

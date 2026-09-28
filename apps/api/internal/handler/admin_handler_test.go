@@ -15,20 +15,22 @@ import (
 
 	"github.com/suncrestlabs/nester/apps/api/internal/auth"
 	admindomain "github.com/suncrestlabs/nester/apps/api/internal/domain/admin"
-	"github.com/suncrestlabs/nester/apps/api/internal/domain/offramp"
-	"github.com/suncrestlabs/nester/apps/api/internal/domain/user"
+	"github.com/suncrestlabs/nester/apps/api/internal/domain/savingsgoal"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/vault"
 	"github.com/suncrestlabs/nester/apps/api/internal/middleware"
 	"github.com/suncrestlabs/nester/apps/api/internal/service"
 	"github.com/suncrestlabs/nester/apps/api/pkg/response"
 )
 
+type noopRevocationChecker struct{}
+
+func (noopRevocationChecker) IsRevoked(context.Context, string) (bool, error) { return false, nil }
+
 type adminHandlerStubService struct {
-	dashboard   admindomain.VaultHealthDashboard
-	vaults      map[uuid.UUID]admindomain.VaultDetail
-	settlements []admindomain.SettlementSummary
-	users       []admindomain.UserSummary
-	health      admindomain.DetailedHealth
+	dashboard admindomain.VaultHealthDashboard
+	vaults    map[uuid.UUID]admindomain.VaultDetail
+	users     []admindomain.UserSummary
+	health    admindomain.DetailedHealth
 }
 
 func newAdminHandlerStubService(vaultID uuid.UUID) *adminHandlerStubService {
@@ -72,30 +74,11 @@ func newAdminHandlerStubService(vaultID uuid.UUID) *adminHandlerStubService {
 			SystemAlerts: []admindomain.SystemAlert{},
 		},
 		vaults: map[uuid.UUID]admindomain.VaultDetail{vaultID: detail},
-		settlements: []admindomain.SettlementSummary{
-			{
-				Settlement: offramp.Settlement{
-					ID:           uuid.New(),
-					UserID:       userID,
-					VaultID:      vaultID,
-					Amount:       decimal.RequireFromString("20.00"),
-					Currency:     "USDC",
-					FiatCurrency: "USD",
-					FiatAmount:   decimal.RequireFromString("20.00"),
-					ExchangeRate: decimal.RequireFromString("1.00"),
-					Destination:  offramp.Destination{Type: "bank_transfer", Provider: "bank", AccountNumber: "123", AccountName: "Test", BankCode: "000"},
-					Status:       offramp.StatusInitiated,
-					CreatedAt:    now,
-				},
-				WalletAddress: "GADMINWALLET",
-			},
-		},
 		users: []admindomain.UserSummary{
 			{
 				ID:             userID,
 				WalletAddress:  "GADMINWALLET",
 				DisplayName:    "Admin User",
-				KYCStatus:      user.KYCStatusVerified,
 				VaultCount:     1,
 				TotalDeposited: decimal.RequireFromString("1000.00"),
 				CreatedAt:      now,
@@ -103,12 +86,11 @@ func newAdminHandlerStubService(vaultID uuid.UUID) *adminHandlerStubService {
 			},
 		},
 		health: admindomain.DetailedHealth{
-			Database:           admindomain.HealthStatus{Status: "healthy", LastCheckedAt: now},
-			StellarRPC:         admindomain.HealthStatus{Status: "healthy", LastCheckedAt: now},
-			SettlementProvider: admindomain.HealthStatus{Status: "healthy", LastCheckedAt: now},
-			EventIndexer:       admindomain.HealthStatus{Status: "healthy", LastCheckedAt: now, LastEventAt: &now},
-			DiskUsage:          "40.0%",
-			Uptime:             "5m0s",
+			Database:     admindomain.HealthStatus{Status: "healthy", LastCheckedAt: now},
+			StellarRPC:   admindomain.HealthStatus{Status: "healthy", LastCheckedAt: now},
+			EventIndexer: admindomain.HealthStatus{Status: "healthy", LastCheckedAt: now, LastEventAt: &now},
+			DiskUsage:    "40.0%",
+			Uptime:       "5m0s",
 		},
 	}
 }
@@ -213,10 +195,6 @@ func (s *adminHandlerStubService) DeleteAllocation(_ context.Context, input serv
 	return vault.ErrAllocationNotFound
 }
 
-func (s *adminHandlerStubService) ListSettlements(context.Context, admindomain.SettlementListFilter) ([]admindomain.SettlementSummary, int, error) {
-	return s.settlements, len(s.settlements), nil
-}
-
 func (s *adminHandlerStubService) ListUsers(context.Context, admindomain.UserListFilter) ([]admindomain.UserSummary, int, error) {
 	return s.users, len(s.users), nil
 }
@@ -227,6 +205,22 @@ func (s *adminHandlerStubService) ListVaultRebalances(context.Context, uuid.UUID
 
 func (s *adminHandlerStubService) GetDetailedHealth(context.Context) (admindomain.DetailedHealth, error) {
 	return s.health, nil
+}
+
+func (s *adminHandlerStubService) ListGoalTemplates(context.Context) ([]savingsgoal.GoalTemplate, error) {
+	return nil, nil
+}
+
+func (s *adminHandlerStubService) CreateGoalTemplate(context.Context, service.CreateGoalTemplateInput) (savingsgoal.GoalTemplate, error) {
+	return savingsgoal.GoalTemplate{}, nil
+}
+
+func (s *adminHandlerStubService) UpdateGoalTemplate(context.Context, service.UpdateGoalTemplateInput) (savingsgoal.GoalTemplate, error) {
+	return savingsgoal.GoalTemplate{}, nil
+}
+
+func (s *adminHandlerStubService) DeleteGoalTemplate(context.Context, uuid.UUID) error {
+	return nil
 }
 
 func (s *adminHandlerStubService) TriggerRebalance(_ context.Context, id uuid.UUID, req admindomain.RebalanceRequest) (admindomain.RebalanceResponse, error) {
@@ -292,7 +286,7 @@ func TestAdminHandlerAuthDashboardRequiresAdmin(t *testing.T) {
 	rules := []middleware.RouteRule{
 		{PathPrefix: "/api/v1/admin/", Role: "admin"},
 	}
-	protected := middleware.Authenticate("admin-test-secret", "", rules, nil)(mux)
+	protected := middleware.Authenticate("admin-test-secret", "", rules, noopRevocationChecker{})(mux)
 	server := httptest.NewServer(protected)
 	defer server.Close()
 
@@ -380,26 +374,6 @@ func TestAdminHandlerListPauseVerifyFlow(t *testing.T) {
 	}
 }
 
-func TestAdminHandlerDateFilterValidation(t *testing.T) {
-	vaultID := uuid.New()
-	h := NewAdminHandler(newAdminHandlerStubService(vaultID), nil)
-	mux := http.NewServeMux()
-	h.Register(mux)
-
-	server := httptest.NewServer(mux)
-	defer server.Close()
-
-	resp, err := http.Get(server.URL + "/api/v1/admin/settlements?date_from=not-a-date")
-	if err != nil {
-		t.Fatalf("GET settlements error = %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-}
-
 func TestAdminHandlerAuthListPauseVerify(t *testing.T) {
 	vaultID := uuid.New()
 	svc := newAdminHandlerStubService(vaultID)
@@ -411,7 +385,7 @@ func TestAdminHandlerAuthListPauseVerify(t *testing.T) {
 	rules := []middleware.RouteRule{
 		{PathPrefix: "/api/v1/admin/", Role: "admin"},
 	}
-	protected := middleware.Authenticate("admin-test-secret", "", rules, nil)(mux)
+	protected := middleware.Authenticate("admin-test-secret", "", rules, noopRevocationChecker{})(mux)
 	server := httptest.NewServer(protected)
 	defer server.Close()
 
@@ -473,7 +447,7 @@ func TestAdminHandlerRebalanceAuth(t *testing.T) {
 	rules := []middleware.RouteRule{
 		{PathPrefix: "/api/v1/admin/", Role: "admin"},
 	}
-	protected := middleware.Authenticate("admin-test-secret", "", rules, nil)(mux)
+	protected := middleware.Authenticate("admin-test-secret", "", rules, noopRevocationChecker{})(mux)
 	server := httptest.NewServer(protected)
 	defer server.Close()
 
@@ -512,7 +486,7 @@ func TestAdminHandlerAllocationEndpointsRequireAdmin(t *testing.T) {
 	mux := http.NewServeMux()
 	h.Register(mux)
 	rules := []middleware.RouteRule{{PathPrefix: "/api/v1/admin/", Role: "admin"}}
-	protected := middleware.Authenticate("admin-test-secret", "", rules, nil)(mux)
+	protected := middleware.Authenticate("admin-test-secret", "", rules, noopRevocationChecker{})(mux)
 	server := httptest.NewServer(protected)
 	defer server.Close()
 
@@ -592,9 +566,6 @@ func (adminErrStub) UpdateAllocation(context.Context, service.UpdateAllocationIn
 }
 func (adminErrStub) DeleteAllocation(context.Context, service.DeleteAllocationInput) error {
 	return nil
-}
-func (adminErrStub) ListSettlements(context.Context, admindomain.SettlementListFilter) ([]admindomain.SettlementSummary, int, error) {
-	return nil, 0, nil
 }
 func (adminErrStub) ListUsers(context.Context, admindomain.UserListFilter) ([]admindomain.UserSummary, int, error) {
 	return nil, 0, nil
