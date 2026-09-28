@@ -1,12 +1,21 @@
 package middleware
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
 
 	"github.com/suncrestlabs/nester/apps/api/internal/auth"
 )
+
+// SessionRevocationChecker reports whether a session has been revoked.
+// Satisfied by *postgres.SessionRepository's IsRevokedString (a narrower
+// interface so this package doesn't depend on the postgres or session domain
+// packages).
+type SessionRevocationChecker interface {
+	IsRevokedString(ctx context.Context, sessionID string) (bool, error)
+}
 
 // RouteRule describes the authentication policy for a URL prefix + method pair.
 type RouteRule struct {
@@ -28,7 +37,13 @@ type RouteRule struct {
 // secret.  rules are evaluated in order; the first matching rule determines
 // access policy.  If no rule matches, the request is treated as protected
 // (auth required, no specific scope).
-func Authenticate(secret, serviceAPIKey string, rules []RouteRule) func(http.Handler) http.Handler {
+//
+// revocation, when non-nil, is consulted on every request carrying a session
+// ID (sid) claim (#1327): a revoked session is rejected with 401 immediately,
+// rather than waiting for the token's natural expiry. Tokens without a sid
+// claim (e.g. service-to-service auth, or tokens issued before this claim
+// existed) skip the check.
+func Authenticate(secret, serviceAPIKey string, rules []RouteRule, revocation SessionRevocationChecker) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rule := matchRule(rules, r)
@@ -61,6 +76,18 @@ func Authenticate(secret, serviceAPIKey string, rules []RouteRule) func(http.Han
 			if err != nil {
 				writeMiddlewareError(w, http.StatusUnauthorized, err.Error())
 				return
+			}
+
+			if revocation != nil && claims.SessionID != "" {
+				revoked, err := revocation.IsRevokedString(r.Context(), claims.SessionID)
+				if err != nil {
+					writeMiddlewareError(w, http.StatusInternalServerError, "failed to check session status")
+					return
+				}
+				if revoked {
+					writeMiddlewareError(w, http.StatusUnauthorized, "session has been revoked")
+					return
+				}
 			}
 
 			user := auth.User{

@@ -25,6 +25,10 @@ type Claims struct {
 	Roles         []string `json:"roles,omitempty"`
 	ExpiresAt     int64    `json:"exp,omitempty"`
 	IssuedAt      int64    `json:"iat,omitempty"`
+	// SessionID identifies the sessions row this token was issued for, so the
+	// revocation-list check (#1327) can reject it immediately once that row's
+	// revoked_at is set, instead of waiting for natural token expiry.
+	SessionID string `json:"sid,omitempty"`
 }
 
 // ParseJWT validates an HS256 Bearer token signed with secret and returns

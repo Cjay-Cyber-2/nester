@@ -131,6 +131,18 @@ type Repository interface {
 
 	// Stats returns an aggregate snapshot for metrics.
 	Stats(ctx context.Context, now time.Time) (Stats, error)
+
+	// GetByID returns a single job by id, for admin inspection.
+	GetByID(ctx context.Context, id uuid.UUID) (Job, error)
+
+	// ListDead returns dead-letter jobs ordered by most recently updated first,
+	// for admin inspection (#1329). limit/offset paginate; limit<=0 defaults to 50.
+	ListDead(ctx context.Context, limit, offset int) ([]Job, error)
+
+	// ManualRetry resets a dead job back to pending with a fresh attempts
+	// counter so it re-enters the normal dequeue/lease cycle (#1329). It is a
+	// no-op error (ErrNotFound) if the job is not currently dead.
+	ManualRetry(ctx context.Context, id uuid.UUID, runAt time.Time) error
 }
 
 // Handler executes a job. Implementations MUST be idempotent because a job can

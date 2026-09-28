@@ -292,7 +292,7 @@ func TestAdminHandlerAuthDashboardRequiresAdmin(t *testing.T) {
 	rules := []middleware.RouteRule{
 		{PathPrefix: "/api/v1/admin/", Role: "admin"},
 	}
-	protected := middleware.Authenticate("admin-test-secret", "", rules)(mux)
+	protected := middleware.Authenticate("admin-test-secret", "", rules, nil)(mux)
 	server := httptest.NewServer(protected)
 	defer server.Close()
 
@@ -411,7 +411,7 @@ func TestAdminHandlerAuthListPauseVerify(t *testing.T) {
 	rules := []middleware.RouteRule{
 		{PathPrefix: "/api/v1/admin/", Role: "admin"},
 	}
-	protected := middleware.Authenticate("admin-test-secret", "", rules)(mux)
+	protected := middleware.Authenticate("admin-test-secret", "", rules, nil)(mux)
 	server := httptest.NewServer(protected)
 	defer server.Close()
 
@@ -473,7 +473,7 @@ func TestAdminHandlerRebalanceAuth(t *testing.T) {
 	rules := []middleware.RouteRule{
 		{PathPrefix: "/api/v1/admin/", Role: "admin"},
 	}
-	protected := middleware.Authenticate("admin-test-secret", "", rules)(mux)
+	protected := middleware.Authenticate("admin-test-secret", "", rules, nil)(mux)
 	server := httptest.NewServer(protected)
 	defer server.Close()
 
@@ -512,7 +512,7 @@ func TestAdminHandlerAllocationEndpointsRequireAdmin(t *testing.T) {
 	mux := http.NewServeMux()
 	h.Register(mux)
 	rules := []middleware.RouteRule{{PathPrefix: "/api/v1/admin/", Role: "admin"}}
-	protected := middleware.Authenticate("admin-test-secret", "", rules)(mux)
+	protected := middleware.Authenticate("admin-test-secret", "", rules, nil)(mux)
 	server := httptest.NewServer(protected)
 	defer server.Close()
 

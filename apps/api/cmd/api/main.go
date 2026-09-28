@@ -244,7 +244,8 @@ func run() error {
 		baseLogger.Info("challenge store: in-memory (single-instance only)")
 	}
 
-	authService := service.NewAuthService(challengeStore, userService, cfg.Auth())
+	sessionRepo := postgres.NewSessionRepository(db)
+	authService := service.NewAuthService(challengeStore, userService, cfg.Auth(), sessionRepo)
 	authHandler := handler.NewAuthHandler(authService)
 
 	oracleService := oracle.NewRateService(cfg.Stellar().HorizonURL(), cfg.Stellar().USDCIssuer())
@@ -433,6 +434,22 @@ func run() error {
 	analyticsHandler := handler.NewAnalyticsHandler(performanceService)
 	analyticsHandler.Register(mux)
 
+	// Protocol-level yield comparison over time (#1324).
+	protocolComparisonRepo := postgres.NewAnalyticsComparisonRepository(db)
+	protocolComparisonService := service.NewProtocolComparisonService(protocolComparisonRepo)
+	protocolComparisonHandler := handler.NewProtocolComparisonHandler(protocolComparisonService)
+	protocolComparisonHandler.Register(mux)
+
+	// System-wide maintenance mode (#1328): halt or read-only, gated to admins.
+	systemStateRepo := postgres.NewSystemStateRepository(db)
+	maintenanceHandler := handler.NewMaintenanceHandler(systemStateRepo)
+	maintenanceHandler.Register(mux)
+	maintenanceGate := middleware.NewMaintenanceGate(systemStateRepo, 5*time.Second)
+
+	// Session admin (#1327): manual revoke, gated to admins.
+	sessionAdminHandler := handler.NewSessionAdminHandler(sessionRepo)
+	sessionAdminHandler.Register(mux)
+
 	// Risk service
 	riskService := services.NewRiskService(vaultRepository)
 	riskHandler := handler.NewRiskHandler(riskService)
@@ -591,6 +608,10 @@ func run() error {
 	jobQueueRepo := postgres.NewJobRepository(db)
 	jobQueueMetrics := jobqueue.NewStdMetrics()
 	jobQueueClient := jobqueue.NewClient(jobQueueRepo, jobQueueMetrics)
+
+	// Dead-letter inspection and manual retry (#1329), gated to admins.
+	jobQueueAdminHandler := handler.NewJobQueueAdminHandler(jobQueueRepo)
+	jobQueueAdminHandler.Register(mux)
 
 	// Recurring deposit sweep (#846): classified SINGLETON (money-moving —
 	// see RecurringDepositJob's doc comment). The sweep loop itself only
@@ -757,7 +778,7 @@ func run() error {
 		{PathPrefix: "/api/v1/admin/", Public: false, Role: "admin"},
 		{PathPrefix: "/api/v1/", Public: false},
 	}
-	authenticator := middleware.Authenticate(cfg.Auth().Secret(), cfg.Auth().ServiceAPIKey(), authRules)
+	authenticator := middleware.Authenticate(cfg.Auth().Secret(), cfg.Auth().ServiceAPIKey(), authRules, sessionRepo)
 	// Tell the rate-limit client-IP extractor how many trusted proxies sit in
 	// front of the API so it derives the originating client IP from
 	// X-Forwarded-For instead of collapsing all traffic onto the proxy address.
@@ -812,10 +833,12 @@ func run() error {
 						authRouteLimiter(
 							writeLimiter(
 								authenticator(
-									settlementLimiter(
-										walletLimiter(
-											middleware.LimitRequestBody(1 * 1024 * 1024)(
-												middleware.Logging(baseLogger)(mux),
+									maintenanceGate.Middleware(authRules)(
+										settlementLimiter(
+											walletLimiter(
+												middleware.LimitRequestBody(1 * 1024 * 1024)(
+													middleware.Logging(baseLogger)(mux),
+												),
 											),
 										),
 									),

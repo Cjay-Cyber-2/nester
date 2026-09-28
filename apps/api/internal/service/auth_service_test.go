@@ -13,8 +13,44 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/suncrestlabs/nester/apps/api/internal/auth"
+	"github.com/suncrestlabs/nester/apps/api/internal/domain/session"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/user"
 )
+
+type mockSessionRepository struct {
+	sessions map[uuid.UUID]session.Session
+}
+
+func newMockSessionRepository() *mockSessionRepository {
+	return &mockSessionRepository{sessions: make(map[uuid.UUID]session.Session)}
+}
+
+func (m *mockSessionRepository) Create(_ context.Context, s session.Session) (uuid.UUID, error) {
+	if s.ID == uuid.Nil {
+		s.ID = uuid.New()
+	}
+	m.sessions[s.ID] = s
+	return s.ID, nil
+}
+
+func (m *mockSessionRepository) IsRevoked(_ context.Context, id uuid.UUID) (bool, error) {
+	s, ok := m.sessions[id]
+	if !ok {
+		return true, nil
+	}
+	return s.RevokedAt != nil, nil
+}
+
+func (m *mockSessionRepository) Revoke(_ context.Context, id uuid.UUID) error {
+	s, ok := m.sessions[id]
+	if !ok {
+		return session.ErrNotFound
+	}
+	now := time.Now()
+	s.RevokedAt = &now
+	m.sessions[id] = s
+	return nil
+}
 
 type mockAuthConfig struct {
 	secret          string
@@ -87,7 +123,7 @@ func setupAuthService() (AuthService, *keypair.Full) {
 	repo := newMockRepo()
 	userService := NewUserService(repo)
 	store := NewInMemoryChallengeStore(cfg.ChallengeExpiry())
-	authSvc := NewAuthService(store, userService, cfg)
+	authSvc := NewAuthService(store, userService, cfg, newMockSessionRepository())
 
 	kp, _ := keypair.Random()
 	return authSvc, kp
@@ -149,7 +185,7 @@ func TestAuthService_VerifyAndIssue_ExpiredChallenge(t *testing.T) {
 		challengeExpiry: -1 * time.Second,
 	}
 	repo := newMockRepo()
-	svc := NewAuthService(NewInMemoryChallengeStore(cfg.ChallengeExpiry()), NewUserService(repo), cfg)
+	svc := NewAuthService(NewInMemoryChallengeStore(cfg.ChallengeExpiry()), NewUserService(repo), cfg, newMockSessionRepository())
 
 	kp, _ := keypair.Random()
 	challenge, _ := svc.GenerateChallenge(context.Background(), kp.Address())
@@ -181,7 +217,7 @@ func TestAuthService_VerifyAndIssue_AdminRolePopulatedInToken(t *testing.T) {
 	repo.users[kp.Address()] = adminUser
 	repo.roles[adminUser.ID] = []string{"admin"}
 
-	svc := NewAuthService(NewInMemoryChallengeStore(cfg.ChallengeExpiry()), NewUserService(repo), cfg)
+	svc := NewAuthService(NewInMemoryChallengeStore(cfg.ChallengeExpiry()), NewUserService(repo), cfg, newMockSessionRepository())
 
 	challenge, err := svc.GenerateChallenge(context.Background(), kp.Address())
 	require.NoError(t, err)
@@ -207,7 +243,7 @@ func TestAuthService_VerifyAndIssue_RegularUserHasEmptyRoles(t *testing.T) {
 	}
 	repo := newMockRepo()
 	kp, _ := keypair.Random()
-	svc := NewAuthService(NewInMemoryChallengeStore(cfg.ChallengeExpiry()), NewUserService(repo), cfg)
+	svc := NewAuthService(NewInMemoryChallengeStore(cfg.ChallengeExpiry()), NewUserService(repo), cfg, newMockSessionRepository())
 
 	challenge, err := svc.GenerateChallenge(context.Background(), kp.Address())
 	require.NoError(t, err)

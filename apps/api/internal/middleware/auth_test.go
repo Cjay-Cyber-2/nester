@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -27,7 +28,7 @@ var defaultRules = []RouteRule{
 
 // authHandler wraps ok200 with Authenticate using defaultRules and testSecret.
 func authHandler() http.Handler {
-	return Authenticate(testSecret, "", defaultRules)(ok200)
+	return Authenticate(testSecret, "", defaultRules, nil)(ok200)
 }
 
 // makeToken creates a signed JWT for test assertions.
@@ -170,7 +171,7 @@ func TestAuthGetUserFromContextReturnsCorrectUser(t *testing.T) {
 	capture := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		gotUser, gotOK = auth.GetUserFromContext(r.Context())
 	})
-	handler := Authenticate(testSecret, "", defaultRules)(capture)
+	handler := Authenticate(testSecret, "", defaultRules, nil)(capture)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -187,6 +188,85 @@ func TestAuthGetUserFromContextReturnsCorrectUser(t *testing.T) {
 	}
 	if len(gotUser.Scopes) != len(want.Scopes) {
 		t.Errorf("Scopes = %v, want %v", gotUser.Scopes, want.Scopes)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Session revocation (#1327)
+// ---------------------------------------------------------------------------
+
+// fakeRevocationChecker reports the given sessions as revoked.
+type fakeRevocationChecker struct {
+	revoked map[string]bool
+	err     error
+}
+
+func (f fakeRevocationChecker) IsRevokedString(_ context.Context, sessionID string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.revoked[sessionID], nil
+}
+
+func TestAuthRevokedSessionIsRejected(t *testing.T) {
+	token := makeToken(t, auth.Claims{
+		Subject:   "user-1",
+		SessionID: "session-revoked",
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+
+	handler := Authenticate(testSecret, "", defaultRules, fakeRevocationChecker{
+		revoked: map[string]bool{"session-revoked": true},
+	})(ok200)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("got %d, want 401 for revoked session", rec.Code)
+	}
+}
+
+func TestAuthLiveSessionPassesThrough(t *testing.T) {
+	token := makeToken(t, auth.Claims{
+		Subject:   "user-1",
+		SessionID: "session-live",
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+
+	handler := Authenticate(testSecret, "", defaultRules, fakeRevocationChecker{
+		revoked: map[string]bool{"session-revoked": true},
+	})(ok200)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 for live session", rec.Code)
+	}
+}
+
+func TestAuthNoSessionClaimSkipsRevocationCheck(t *testing.T) {
+	token := makeToken(t, auth.Claims{
+		Subject:   "user-1",
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+
+	handler := Authenticate(testSecret, "", defaultRules, fakeRevocationChecker{
+		revoked: map[string]bool{"": true}, // would reject if the empty sid were checked
+	})(ok200)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 when token carries no sid claim", rec.Code)
 	}
 }
 

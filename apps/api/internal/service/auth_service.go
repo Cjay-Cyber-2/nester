@@ -9,8 +9,11 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stellar/go/keypair"
+
 	"github.com/suncrestlabs/nester/apps/api/internal/auth"
+	"github.com/suncrestlabs/nester/apps/api/internal/domain/session"
 )
 
 // sep53MessagePrefix is the fixed prefix defined by SEP-53 ("Sign and Verify
@@ -44,13 +47,15 @@ type authService struct {
 	store       ChallengeStore
 	userService *UserService
 	config      AuthConfig
+	sessions    session.Repository
 }
 
-func NewAuthService(store ChallengeStore, userService *UserService, cfg AuthConfig) AuthService {
+func NewAuthService(store ChallengeStore, userService *UserService, cfg AuthConfig, sessions session.Repository) AuthService {
 	return &authService{
 		store:       store,
 		userService: userService,
 		config:      cfg,
+		sessions:    sessions,
 	}
 }
 
@@ -112,12 +117,29 @@ func (s *authService) VerifyAndIssue(ctx context.Context, walletAddress, signatu
 		return "", err
 	}
 
+	expiresAt := time.Now().Add(s.config.TokenExpiry())
+	sessionID := uuid.New()
+	if _, err := s.sessions.Create(ctx, session.Session{
+		ID:            sessionID,
+		UserID:        user.ID,
+		WalletAddress: walletAddress,
+		// The API validates the JWT signature itself, not by looking up
+		// token_hash/refresh_token_hash — those columns predate this
+		// revocation-check work and aren't populated by this flow.
+		TokenHash:        sessionID.String(),
+		RefreshTokenHash: sessionID.String(),
+		ExpiresAt:        expiresAt,
+	}); err != nil {
+		return "", err
+	}
+
 	claims := auth.Claims{
 		Subject:       user.ID.String(),
 		WalletAddress: walletAddress,
 		IssuedAt:      time.Now().Unix(),
-		ExpiresAt:     time.Now().Add(s.config.TokenExpiry()).Unix(),
+		ExpiresAt:     expiresAt.Unix(),
 		Roles:         roles,
+		SessionID:     sessionID.String(),
 	}
 
 	return auth.MakeJWT(claims, s.config.Secret())
