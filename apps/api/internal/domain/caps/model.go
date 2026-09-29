@@ -1,14 +1,11 @@
-// Package caps enforces deposit limits: a per-vault soft capacity and a
-// per-user rolling 24h cap across all vaults (nester#1316). Kept
-// dependency-free, like domain/moneypath, so both the service layer and the
-// postgres repository can depend on it without an import cycle.
 package caps
 
 import (
+	"context"
 	"errors"
-
 	"github.com/shopspring/decimal"
 )
+
 
 // ErrVaultCapExceeded is returned when crediting a deposit would push a
 // vault's current_balance past its soft_capacity.
@@ -40,4 +37,12 @@ func CheckUserDailyCap(rolling24hTotal decimal.Decimal, cap *decimal.Decimal, am
 		return ErrUserDailyCapExceeded
 	}
 	return nil
+}
+var (
+	ErrTVLCapExceeded = errors.New("vault TVL cap exceeded on mainnet")
+)
+
+// VaultTVLCapManager defines the interface for checking and enforcing TVL caps per vault on mainnet.
+type VaultTVLCapManager interface {
+	CheckDepositCap(ctx context.Context, vaultID string, depositAmount float64) error
 }
