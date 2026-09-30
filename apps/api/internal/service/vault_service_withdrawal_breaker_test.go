@@ -21,14 +21,14 @@ func TestWithdrawalCircuitBreakerHaltsVault(t *testing.T) {
 		UserID: userID, ContractAddress: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Currency: "USDC",
 	})
 	if err != nil {
-		T.Fatalf("CreateVault: %v", err)
+		t.Fatalf("CreateVault: %v", err)
 	}
 
 	_, err = svc.RecordDeposit(context.Background(), RecordDepositInput{
 		VaultID: created.ID, Amount: decimal.RequireFromString("100"),
 	})
 	if err != nil {
-		T.Fatalf("RecordDeposit: %v", err)
+		t.Fatalf("RecordDeposit: %v", err)
 	}
 
 	// Withdraw 30% of TVL within the window (Threshold is 25%)
@@ -36,14 +36,14 @@ func TestWithdrawalCircuitBreakerHaltsVault(t *testing.T) {
 		VaultID: created.ID, Amount: decimal.RequireFromString("30"), TxHash: "hash-1",
 	})
 	if err != nil && err != vault.ErrVaultPausedByBreaker {
-		T.Fatalf("RecordWithdrawal unexpected error: %v", err)
+		t.Fatalf("RecordWithdrawal unexpected error: %v", err)
 	}
 
 	vaultModel, err := svc.GetVault(context.Background(), created.ID)
 	if err != nil {
-		T.Fatalf("GetVault: %v", err)
+		t.Fatalf("GetVault: %v", err)
 	}
-	if !vaultModel.Paused {
-		T.Fatal("expected vault to be paused by withdrawal circuit breaker when outflows exceed threshold")
+	if vaultModel.Status != vault.StatusPaused {
+		t.Fatal("expected vault to be paused by withdrawal circuit breaker when outflows exceed threshold")
 	}
 }
