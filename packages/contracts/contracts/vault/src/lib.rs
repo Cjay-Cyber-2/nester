@@ -448,6 +448,8 @@ enum DataKey {
     SharePriceBaseline,
     SharePriceBaselineAt,
     SourceFailureCount,
+    DepositAllowlistEnabled,
+    DepositAllowlisted(Address),
     BreakerConfigV2,
     // Multi-asset vault support (#804)
     BasketAssets,         // Vec<AssetConfig> for multi-asset vaults
@@ -2277,6 +2279,46 @@ impl VaultContract {
         env.storage().instance().set(&DataKey::MaxDeposit, &amount);
     }
 
+    /// Enable or disable the mainnet deposit allowlist gate.
+    ///
+    /// The gate is disabled by default for backwards compatibility. When it is
+    /// enabled, only addresses explicitly added with
+    /// [`Self::set_deposit_allowlisted`] may deposit.
+    pub fn set_deposit_allowlist_enabled(env: Env, caller: Address, enabled: bool) {
+        require_initialized(&env);
+        caller.require_auth();
+        AccessControl::require_role(&env, &caller, Role::Admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::DepositAllowlistEnabled, &enabled);
+    }
+
+    /// Add or remove one depositor from the controlled-rollout allowlist.
+    pub fn set_deposit_allowlisted(env: Env, caller: Address, depositor: Address, allowed: bool) {
+        require_initialized(&env);
+        caller.require_auth();
+        AccessControl::require_role(&env, &caller, Role::Admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DepositAllowlisted(depositor), &allowed);
+    }
+
+    /// Returns whether the controlled-rollout deposit gate is enabled.
+    pub fn deposit_allowlist_enabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::DepositAllowlistEnabled)
+            .unwrap_or(false)
+    }
+
+    /// Returns whether `depositor` is currently admitted by the allowlist.
+    pub fn is_deposit_allowlisted(env: Env, depositor: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DepositAllowlisted(depositor))
+            .unwrap_or(false)
+    }
+
     pub fn set_min_deposit(env: Env, caller: Address, amount: i128) {
         require_initialized(&env);
         caller.require_auth();
@@ -3712,6 +3754,11 @@ impl VaultContract {
         }
 
         user.require_auth();
+        if Self::deposit_allowlist_enabled(env.clone())
+            && !Self::is_deposit_allowlisted(env.clone(), user.clone())
+        {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
         accrue_management_fee(&env);
         release_vested_yield(&env);
 
