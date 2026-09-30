@@ -691,26 +691,6 @@ func (s *VaultService) RecordWithdrawal(ctx context.Context, input RecordWithdra
 	startedAt := time.Now()
 	defer func() { recordFlow(s.metrics, metrics.FlowWithdrawal, startedAt, err) }()
 
-	breakerConfig := vault.DefaultOutflowBreakerConfig()
-	if breakerConfig.Enabled {
-		outflows, err := s.repository.ListWithdrawalsInWindow(ctx, input.VaultID, breakerConfig.Window)
-		if err != nil {
-			return vault.Vault{}, err
-		}
-		sumOutflows := input.Amount
-		for _, w := range outflows {
-			sumOutflows = sumOutflows.Add(w.Amount)
-		}
-		tvl := existing.CurrentBalance
-		if tvl.IsPositive() {
-			pct := sumOutflows.Div(tvl).Mul(decimal.NewFromInt(100))
-			if pct.GreaterThanOrEqual(breakerConfig.ThresholdPercent) {
-				_ = s.repository.UpdateVault(ctx, input.VaultID, existing.ContractAddress, vault.StatusPaused)
-				return vault.Vault{}, vault.ErrVaultPausedByBreaker
-			}
-		}
-	}
-
 	// Global pause (#1120), independent of the deposit switch: the common
 	// incident response is to stop money entering while still letting users
 	// take theirs out.
@@ -731,6 +711,28 @@ func (s *VaultService) RecordWithdrawal(ctx context.Context, input RecordWithdra
 	existing, err := s.repository.GetVault(ctx, input.VaultID)
 	if err != nil {
 		return vault.Vault{}, err
+	}
+
+	breakerConfig := vault.DefaultOutflowBreakerConfig()
+	if breakerConfig.Enabled {
+		transactions, err := s.repository.ListUserVaultTransactions(ctx, existing.UserID, input.VaultID)
+		if err != nil {
+			return vault.Vault{}, err
+		}
+		cutoff := time.Now().Add(-breakerConfig.Window)
+		sumOutflows := input.Amount
+		for _, transaction := range transactions {
+			if transaction.Type == "withdrawal" && !transaction.CreatedAt.Before(cutoff) {
+				sumOutflows = sumOutflows.Add(transaction.Amount)
+			}
+		}
+		if existing.CurrentBalance.IsPositive() {
+			pct := sumOutflows.Div(existing.CurrentBalance).Mul(decimal.NewFromInt(100))
+			if pct.GreaterThanOrEqual(breakerConfig.ThresholdPercent) {
+				_ = s.repository.UpdateVault(ctx, input.VaultID, existing.ContractAddress, vault.StatusPaused)
+				return vault.Vault{}, vault.ErrVaultPausedByBreaker
+			}
+		}
 	}
 
 	if existing.Status == vault.StatusClosed {
