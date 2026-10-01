@@ -1,34 +1,122 @@
+# Alertmanager routing for the local observability profile (nester#1056,
+# nester#1378).
+#
+# This file exists so that the routing *policy* — what pages, what tickets, how
+# alerts group, how long they wait before repeating, and who is on call — is
+# reviewable in the repo and identical in shape to what a deployed environment
+# runs. Real destinations (PagerDuty, Opsgenie, Slack) are only wired through
+# environment-provided secrets; never commit a live key or webhook URL here.
+
 global:
+  # How long to wait for a resolved notification before declaring an alert
+  # resolved on its own. Must exceed the rule evaluation interval by enough
+  # that a slow evaluation does not flap the alert closed.
   resolve_timeout: 5m
 
 route:
-  group_by: ['alertname', 'slo', 'service']
-  group_wait: 10s
-  group_interval: 1m
+  # Group by the SLO and the burn speed, not by alertname alone. During a
+  # broad incident several SLOs breach at once; grouping this way produces one
+  # notification per affected SLO rather than one per firing series, which is
+  # the difference between a usable page and a pager storm.
+  group_by: ["slo", "burn", "service"]
+
+  # Wait this long for other alerts in the same group before sending the first
+  # notification. Long enough to batch a burst that arrives together, short
+  # enough not to delay a page meaningfully.
+  group_wait: 30s
+
+  # Once a group has notified, wait this long before sending an update about
+  # newly-added alerts in the same group.
+  group_interval: 5m
+
+  # How long before re-notifying about an alert that is still firing. Four
+  # hours for the default: long enough not to nag, short enough that an
+  # unacknowledged incident resurfaces within a shift.
   repeat_interval: 4h
-  receiver: 'pagerduty-oncall'
+
+  receiver: default
+
   routes:
-    - match:
-        severity: page
-      receiver: 'pagerduty-oncall'
-    - match:
-        severity: warning
-      receiver: 'slack-notifications'
+    # Pages. Short repeat interval because an unacknowledged page is the
+    # failure mode that matters most: an alert that fires once at 3am and then
+    # goes quiet is indistinguishable from no alert at all. Primary on-call
+    # path is PagerDuty; continue: true lets the same page also reach the
+    # Opsgenie secondary/backup rotation.
+    - matchers:
+        - severity = "page"
+      receiver: pagerduty-oncall
+      group_wait: 30s
+      repeat_interval: 1h
+      continue: true
+
+    - matchers:
+        - severity = "page"
+      receiver: opsgenie-oncall
+      group_wait: 30s
+      repeat_interval: 1h
+
+    # Tickets. Daily repeat: these are real and should not be forgotten, but
+    # re-notifying every hour about work that is scheduled for business hours
+    # trains people to mute the channel.
+    - matchers:
+        - severity = "ticket"
+      receiver: ticket
+      group_wait: 5m
+      repeat_interval: 24h
+
+    # Warnings route to Slack for visibility without paging anyone.
+    - matchers:
+        - severity = "warning"
+      receiver: slack-notifications
+      group_wait: 30s
+      repeat_interval: 4h
+
+inhibit_rules:
+  # A fast burn on an SLO makes the slow burn on the same SLO redundant: the
+  # fast alert is strictly more urgent and describes the same incident.
+  # Without this, every serious incident delivers two notifications for one
+  # problem, and the second one adds nothing.
+  - source_matchers:
+      - burn = "fast"
+    target_matchers:
+      - burn = "slow"
+    equal: ["slo", "service"]
+
+  # If the scrape target is down, every SLO computed from it will also alert
+  # as its data goes stale. The target being down is the actionable fact; the
+  # derived alerts are noise on top of it.
+  - source_matchers:
+      - alertname = "SLOTargetDown"
+    target_matchers:
+      - severity =~ "page|ticket"
+    equal: ["service"]
 
 receivers:
-  - name: 'pagerduty-oncall'
+  # Intentionally empty for the local stack: a receiver with no configured
+  # destination discards the notification, which is the correct behaviour for
+  # local development. Alerts remain visible in the Alertmanager UI at
+  # http://localhost:9093 for inspection and testing, but cannot reach a
+  # human. Deployed environments supply the webhook/API URL/key below from
+  # the environment; do not commit a real one here.
+  - name: default
+  - name: ticket
+
+  # Primary on-call paging channel (nester#1378).
+  - name: pagerduty-oncall
     pagerduty_configs:
-      - service_key: '${PAGERDUTY_SERVICE_KEY}'
-        client: 'Nester Alertmanager'
-        client_url: 'https://grafana.nester.fi'
+      - service_key: "${PAGERDUTY_SERVICE_KEY}"
+        client: "Nester Alertmanager"
+        client_url: "https://grafana.nester.fi"
         details:
-          firing: '{{ len .Alerts.Firing }}'
+          firing: "{{ len .Alerts.Firing }}"
 
-  - name: 'opsgenie-oncall'
+  # Secondary/backup paging channel so a page is not lost if PagerDuty itself
+  # is unavailable or misconfigured.
+  - name: opsgenie-oncall
     opsgenie_configs:
-      - api_key: '${OPSGENIE_API_KEY}'
-        priority: 'P1'
+      - api_key: "${OPSGENIE_API_KEY}"
+        priority: "P1"
 
-  - name: 'slack-notifications'
+  - name: slack-notifications
     webhook_configs:
-      - url: 'http://localhost:5001/'
+      - url: "${SLACK_WEBHOOK_URL}"
