@@ -114,11 +114,33 @@ func TestScenario_FullMainnetRPCOutage_DegradesGracefullyToReadOrQueue(t *testin
 	require.Error(t, err2)
 
 	health := NewHealthTracker()
-	health.RecordFailure("mainnet-rpc-primary")
-	health.RecordFailure("mainnet-rpc-backup")
+	health.RecordFailure("mainnet-rpc-primary", err1)
+	health.RecordFailure("mainnet-rpc-backup", err2)
 
 	assert.False(t, health.IsHealthy("mainnet-rpc-primary"))
 	assert.False(t, health.IsHealthy("mainnet-rpc-backup"))
+
+	// The health-tracker bookkeeping above only proves the two RPC endpoints
+	// are individually marked unhealthy. The real acceptance criterion is
+	// that the API's aggregation layer does not error destructively (panic,
+	// or surface a raw transport error to the caller) when every registered
+	// source for a data type is down at once — it must degrade to a
+	// structured "unavailable" result instead. Drive the same failures
+	// through the actual aggregator, with both providers wired to the same
+	// chaos-injected HTTP clients used above, and assert on Aggregate's
+	// return value rather than on isolated health-tracker state.
+	primaryProvider := NewDefiLlamaProvider()
+	primaryProvider.SetHTTPClient(primaryClient)
+	backupProvider := NewDefiLlamaProvider()
+	backupProvider.SetHTTPClient(backupClient)
+
+	aggHealth := NewHealthTracker()
+	result, aggErr := Aggregate(context.Background(), "XLM", "USD", []Provider{primaryProvider, backupProvider}, aggHealth, defaultOpts())
+
+	require.Error(t, aggErr, "an all-sources-down aggregate must report an error, not silently return a zero value")
+	assert.True(t, result.Unavailable, "aggregator must surface a structured degraded/unavailable result rather than panicking or erroring destructively")
+	assert.Empty(t, result.SourcesUsed, "no source succeeded, so none may be reported as used")
+	assert.ElementsMatch(t, []string{"defillama", "defillama"}, result.SourcesFailed, "both failed sources must be recorded, not dropped")
 }
 
 // Scenario: DeFiLlama returns HTTP 503 (a Soroban-RPC-style upstream
