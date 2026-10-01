@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,13 +14,36 @@ import (
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/ledger"
 )
 
+// defaultEscalationThresholdUSD is used when RECONCILIATION_ESCALATION_THRESHOLD_USD is unset.
+const defaultEscalationThresholdUSD = 100.0
+
+// LedgerReconciliationConfigFromEnv builds a ledger.ReconciliationConfig, reading the
+// mainnet dollar-threshold for immediate on-call paging from
+// RECONCILIATION_ESCALATION_THRESHOLD_USD (default defaultEscalationThresholdUSD), and
+// determining IsMainnet from the same environment variables isMainnetEnvironment checks.
+func LedgerReconciliationConfigFromEnv(enabled bool, interval time.Duration, toleranceStroops int64) ledger.ReconciliationConfig {
+	threshold := defaultEscalationThresholdUSD
+	if v := os.Getenv("RECONCILIATION_ESCALATION_THRESHOLD_USD"); v != "" {
+		if parsed, err := strconv.ParseFloat(v, 64); err == nil && parsed > 0 {
+			threshold = parsed
+		}
+	}
+	return ledger.ReconciliationConfig{
+		Enabled:                enabled,
+		Interval:               interval,
+		ToleranceStroops:       toleranceStroops,
+		MainnetDollarThreshold: threshold,
+		IsMainnet:              isMainnetEnvironment(),
+	}
+}
+
 // LedgerReconciliationDeps holds dependencies for the reconciliation job.
 type LedgerReconciliationDeps struct {
-	LedgerRepo   ledger.Repository
-	VaultLister  ReconciliationVaultLister // reuses existing vault lister
-	ChainReader  ledger.ChainReader
-	Logger       *slog.Logger
-	Config       ledger.ReconciliationConfig
+	LedgerRepo  ledger.Repository
+	VaultLister ReconciliationVaultLister // reuses existing vault lister
+	ChainReader ledger.ChainReader
+	Logger      *slog.Logger
+	Config      ledger.ReconciliationConfig
 }
 
 // ReconciliationVaultLister lists active vaults with contract addresses for reconciliation.
@@ -61,7 +85,7 @@ func NewLedgerReconciliationJob(deps LedgerReconciliationDeps) *LedgerReconcilia
 }
 
 func (j *LedgerReconciliationJob) SetLeaderChecker(l LeaderChecker) { j.leader = l }
-func (j *LedgerReconciliationJob) isLeader() bool                  { return j.leader == nil || j.leader.IsLeader() }
+func (j *LedgerReconciliationJob) isLeader() bool                   { return j.leader == nil || j.leader.IsLeader() }
 
 func (j *LedgerReconciliationJob) Run(ctx context.Context) {
 	if !j.cfg.Enabled {
@@ -200,8 +224,8 @@ func (j *LedgerReconciliationJob) reconcileVault(ctx context.Context, v Reconcil
 		if j.cfg.MainnetDollarThreshold > 0 {
 			thresholdStroops = parseDecimalToStroops(decimal.NewFromFloat(j.cfg.MainnetDollarThreshold))
 		}
-		isMainnet := isMainnetEnvironment()
-		
+		isMainnet := j.cfg.IsMainnet
+
 		if isMainnet && thresholdStroops > 0 && absDiff > thresholdStroops {
 			// Page on-call immediately with a critical alert log that triggers pagers
 			j.logger.Error("PAGER ALERT: ledger-vs-chain drift exceeded mainnet dollar threshold!",
@@ -215,13 +239,13 @@ func (j *LedgerReconciliationJob) reconcileVault(ctx context.Context, v Reconcil
 			)
 		} else {
 			// Raise alert — log as error
-		j.logger.Error("ledger reconciliation drift beyond tolerance — alerting, not auto-correcting",
-			"vault_id", v.ID,
-			"ledger", ledgerPoolBal,
-			"on_chain", onChainBal,
-			"difference", absDiff,
-			"tolerance", tolerance,
-		)
+			j.logger.Error("ledger reconciliation drift beyond tolerance — alerting, not auto-correcting",
+				"vault_id", v.ID,
+				"ledger", ledgerPoolBal,
+				"on_chain", onChainBal,
+				"difference", absDiff,
+				"tolerance", tolerance,
+			)
 		}
 	} else {
 		j.logger.Debug("ledger reconciliation ok", "vault_id", v.ID, "ledger", ledgerPoolBal, "on_chain", onChainBal)

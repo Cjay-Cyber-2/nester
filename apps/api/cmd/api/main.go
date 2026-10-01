@@ -2559,9 +2559,5 @@ func (a *reconciliationVaultListerAdapter) ListActiveForReconciliation(ctx conte
 }
 
 func ledgerDomainConfig() ledger.ReconciliationConfig {
-	return ledger.ReconciliationConfig{
-		Enabled:          true,
-		Interval:         5 * time.Minute,
-		ToleranceStroops: 1_000_000, // 0.1 USDC
-	}
+	return scheduler.LedgerReconciliationConfigFromEnv(true, 5*time.Minute, 1_000_000) // 0.1 USDC tolerance
 }
