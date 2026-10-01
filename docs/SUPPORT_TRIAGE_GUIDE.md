@@ -120,6 +120,4 @@ issue, not a one-off client problem).
 
 - Mainnet Support & Escalation Tree: [SUPPORT_ESCALATION.md](SUPPORT_ESCALATION.md)
 - Support tooling: `GET /api/v1/admin/users/{id}/money-path` (#1141)
-
-- Support tooling: `GET /api/v1/admin/users/{id}/money-path` (#1141)
 - In-app problem report (attaches context automatically): #1143

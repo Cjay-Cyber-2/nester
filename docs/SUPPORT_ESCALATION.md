@@ -43,7 +43,7 @@ When a user report cannot be resolved by front-line support using the [Support T
 
 ### Tier 3: On-Call Software Engineer (Backend / Contracts)
 - **Who**: Primary on-call engineer via PagerDuty rotation.
-- **Action**: Investigates backend service logs, examines raw on-chain state, engages global pause switches if necessary (`/api/v1/admin/pause`), and coordinates emergency patches.
+- **Action**: Investigates backend service logs, examines raw on-chain state, and coordinates emergency patches. For a system-wide incident, engages the global maintenance mode (`PUT /api/v1/admin/maintenance`), which halts or sets the API read-only across all vaults; for an incident isolated to a single vault, pauses that vault individually instead (`POST /api/v1/admin/vaults/{id}/pause`) rather than halting the whole system.
 - **Escalation Trigger**: Confirmed bug in indexer, API, smart contract, or active P1 security/fund safety incident.
 
 ### Tier 4: Core Protocol Maintainers & Security Lead
