@@ -6,7 +6,7 @@ set -euo pipefail
 # and verifies tables and record integrity.
 
 BACKUP_DIR="${BACKUP_DIR:-./backups}"
-BASE_DSN="${BASE_DSN:-postgres://nester:nester_dev_password@localhost:5432/?sslmode=disable"
+BASE_DSN="${BASE_DSN:-postgres://nester:nester_dev_password@localhost:5432/?sslmode=disable}"
 SCRATCH_DB="nester_restore_drill"
 SCRATCH_DSN="postgres://nester:nester_dev_password@localhost:5432/${SCRATCH_DB}?sslmode=disable"
 
