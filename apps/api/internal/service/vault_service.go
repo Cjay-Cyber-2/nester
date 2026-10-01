@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 
+	"github.com/suncrestlabs/nester/apps/api/internal/domain/caps"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/moneypath"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/vault"
 	"github.com/suncrestlabs/nester/apps/api/internal/metrics"
@@ -153,6 +154,11 @@ type VaultService struct {
 	// built without one (tests, tooling) behaves as it did before the switch
 	// existed. Production wires it in SetMoneyPathSwitches.
 	moneyPathSwitches MoneyPathGate
+	// tvlCapManager enforces the mainnet-only hard TVL cap per vault
+	// (nester#1376). Optional: a nil manager enforces nothing, so a service
+	// built without one (tests, tooling, testnet) behaves as it did before
+	// the cap existed. Production wires it in SetTVLCapManager.
+	tvlCapManager caps.VaultTVLCapManager
 }
 
 // MoneyPathGate reports whether a money-path operation may proceed. Declared
@@ -300,6 +306,12 @@ func (s *VaultService) SetChainEventVerifier(verifier ChainEventVerifier) {
 	s.chainVerifier = verifier
 }
 
+// SetTVLCapManager wires the mainnet-only hard TVL cap per vault
+// (nester#1376). A nil manager (the default) enforces nothing.
+func (s *VaultService) SetTVLCapManager(manager caps.VaultTVLCapManager) {
+	s.tvlCapManager = manager
+}
+
 // SetMetrics wires the SLI recorder for the deposit and withdrawal service
 // level indicators (nester#1056). Optional; when unset, recording no-ops.
 func (s *VaultService) SetMetrics(m *metrics.Metrics) {
@@ -420,6 +432,17 @@ func (s *VaultService) RecordDeposit(ctx context.Context, input RecordDepositInp
 	existing, err := s.repository.GetVault(ctx, input.VaultID)
 	if err != nil {
 		return vault.Vault{}, err
+	}
+
+	// Mainnet-only hard TVL cap per vault (nester#1376). Checked against the
+	// vault's current balance before anything else touches the chain or the
+	// ledger, same as the global pause check above: a request that would
+	// exceed the cap must never reach the deposit invoker or credit a
+	// balance. A nil manager (testnet, tests, tooling) enforces nothing.
+	if s.tvlCapManager != nil {
+		if err := s.tvlCapManager.CheckDepositCap(ctx, input.VaultID, existing.CurrentBalance, input.Amount); err != nil {
+			return vault.Vault{}, err
+		}
 	}
 
 	userID := input.UserID

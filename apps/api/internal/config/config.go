@@ -288,6 +288,13 @@ type StellarConfig struct {
 	operatorFundedDepositVaults string
 	// operatorFundedDepositMaxAmount caps a single operator-funded deposit.
 	operatorFundedDepositMaxAmount string
+	// mainnetVaultTVLCap is the hard ceiling on a single vault's total value
+	// locked, enforced only when networkPassphrase is the mainnet passphrase
+	// (nester#1376). Empty or non-positive means no cap. Kept as a single
+	// deployment-wide ceiling, separate from the per-vault soft_capacity
+	// column, since the goal is a blanket safety limit on mainnet exposure
+	// while it is unproven rather than a per-vault business limit.
+	mainnetVaultTVLCap string
 }
 
 type AllocationConfig struct {
@@ -389,6 +396,7 @@ func Load() (*Config, error) {
 			allocationStrategyAddress:      loader.stringDefault("STELLAR_ALLOCATION_STRATEGY_ADDRESS", ""),
 			withdrawalSlippageBps:          loader.intDefault("WITHDRAWAL_SLIPPAGE_BPS", 50),
 			harvestDefaultCompound:         loader.boolDefault("HARVEST_DEFAULT_COMPOUND", true),
+			mainnetVaultTVLCap:             loader.stringDefault("STELLAR_MAINNET_VAULT_TVL_CAP", "0"),
 		},
 
 		allocation: AllocationConfig{
@@ -1385,6 +1393,13 @@ func (s StellarConfig) OperatorFundedDepositVaults() string {
 // OperatorFundedDepositMaxAmount caps a single operator-funded deposit.
 func (s StellarConfig) OperatorFundedDepositMaxAmount() string {
 	return s.operatorFundedDepositMaxAmount
+}
+
+// MainnetVaultTVLCap returns the configured hard ceiling on a single vault's
+// total value locked, enforced only on mainnet (nester#1376). Empty or
+// non-positive means no cap.
+func (s StellarConfig) MainnetVaultTVLCap() string {
+	return s.mainnetVaultTVLCap
 }
 
 // OperatorAddress returns the operator's public Stellar address. It is public
