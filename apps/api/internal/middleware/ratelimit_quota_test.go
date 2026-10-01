@@ -627,9 +627,17 @@ func TestRedisQuotaChargesCost(t *testing.T) {
 
 	prefix := "test-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	key := "u:quota-1"
-	t.Cleanup(func() { _ = rc.Del(ctx, "rlq:"+prefix+":"+key).Err() })
+	t.Cleanup(func() { _ = rc.Del(ctx, "rlq:"+prefix+":"+key, "rlq:"+prefix+":warmup").Err() })
 
 	l := NewQuotaLimiter(rc, prefix, 50, time.Minute, quietLogger())
+
+	// Prime the connection pool and get the Lua script cached on the server
+	// (EVALSHA miss-then-EVAL on first call) using a throwaway key, so the
+	// timed assertions below aren't the first round trip paying that one-time
+	// cost against a CI Redis container that just started — a slow first
+	// call can exceed the limiter's dial/read timeout and fail open,
+	// which looks identical to "the quota isn't being charged".
+	l.AllowN(ctx, "warmup", CostChainWrite)
 
 	first := l.AllowN(ctx, key, CostChainWrite)
 	if !first.Allowed {
