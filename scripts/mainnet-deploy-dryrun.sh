@@ -20,13 +20,32 @@ cargo build --release --target wasm32-unknown-unknown
 
 echo "[*] Step 2: Setting up local test identities & funding deployer..."
 # In a true dry-run against local node, we use stellar CLI configured for local network
-stellar config network add --global local \
+if ! NETWORK_ADD_OUTPUT=$(stellar config network add --global local \
   --rpc "$RPC_URL" \
   --network-passphrase "$NETWORK_PASSPHRASE" \
-  --horizon-url "$HORIZON_URL" || true
+  --horizon-url "$HORIZON_URL" 2>&1); then
+  if ! echo "$NETWORK_ADD_OUTPUT" | grep -qi "already exists"; then
+    echo "Error: failed to configure local network:" >&2
+    echo "$NETWORK_ADD_OUTPUT" >&2
+    exit 1
+  fi
+fi
 
-stellar config identity add --global deployer --local || true
-stellar config identity add --global multisig-admin --local || true
+if ! IDENTITY_ADD_OUTPUT=$(stellar config identity add --global deployer --local 2>&1); then
+  if ! echo "$IDENTITY_ADD_OUTPUT" | grep -qi "already exists"; then
+    echo "Error: failed to add deployer identity:" >&2
+    echo "$IDENTITY_ADD_OUTPUT" >&2
+    exit 1
+  fi
+fi
+
+if ! IDENTITY_ADD_OUTPUT=$(stellar config identity add --global multisig-admin --local 2>&1); then
+  if ! echo "$IDENTITY_ADD_OUTPUT" | grep -qi "already exists"; then
+    echo "Error: failed to add multisig-admin identity:" >&2
+    echo "$IDENTITY_ADD_OUTPUT" >&2
+    exit 1
+  fi
+fi
 
 DEPLOYER_PUBKEY=$(stellar config identity address deployer)
 MULTISIG_PUBKEY=$(stellar config identity address multisig-admin)
@@ -74,7 +93,16 @@ ADMIN_RESULT=$(stellar contract invoke \
   -- \
   get_admin)
 
-echo "[*] Verified contract admin: $ADMIN_RESULT"
+echo "[*] get_admin returned: $ADMIN_RESULT"
+
+if [ "$ADMIN_RESULT" != "$MULTISIG_PUBKEY" ]; then
+  echo "Error: ownership transfer verification failed." >&2
+  echo "  expected admin (multisig): $MULTISIG_PUBKEY" >&2
+  echo "  actual admin returned:     $ADMIN_RESULT" >&2
+  exit 1
+fi
+
+echo "[*] Verified contract admin matches multisig: $ADMIN_RESULT"
 echo "============================================================"
 echo "Dry-run completed successfully! All steps verified end-to-end."
 echo "============================================================"
