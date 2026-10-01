@@ -33,6 +33,7 @@ import (
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/outbox"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/transaction"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/usersignal"
+	"github.com/suncrestlabs/nester/apps/api/internal/flags"
 	"github.com/suncrestlabs/nester/apps/api/internal/freshness"
 	"github.com/suncrestlabs/nester/apps/api/internal/handler"
 	"github.com/suncrestlabs/nester/apps/api/internal/harvest"
@@ -545,6 +546,19 @@ func run() error {
 	sessionRepository := postgres.NewSessionRepository(db)
 	auditLogger := postgres.NewPostgresAuditLogger(db)
 	anomalyDetector := service.NoopAnomalyDetector{}
+
+	// Mainnet deposit allowlist gate (#1389): controlled rollout of mainnet
+	// deposits via a feature flag (cohort allowlist or percentage rollout).
+	// Fails closed — if the flag store is unreachable or the flag is
+	// unconfigured, deposits are blocked, not allowed (see
+	// FlagDepositAllowlistGate's RegisterFailSafe(..., false) call).
+	flagStore, err := flags.NewStore(db, flagAuditAdapter{auditLogger}, nil)
+	if err != nil {
+		baseLogger.Error("failed to initialize feature flag store", "error", err)
+		os.Exit(1)
+	}
+	flagEvaluator := flags.NewEvaluator(flagStore)
+	vaultService.SetDepositAllowlist(service.NewFlagDepositAllowlistGate(flagEvaluator))
 
 	// Issue #1141: support tooling to inspect a user's money-path state.
 	adminHandler.SetMoneyPathServices(portfolioService, transactionService, auditLogger)
@@ -2556,6 +2570,22 @@ func (a *reconciliationVaultListerAdapter) ListActiveForReconciliation(ctx conte
 		})
 	}
 	return out, nil
+}
+
+// flagAuditAdapter adapts service.AuditLogger to flags.AuditRecorder so
+// every feature-flag change (including flips of the mainnet deposit
+// allowlist) is traceable through the platform's existing audit log.
+type flagAuditAdapter struct {
+	logger service.AuditLogger
+}
+
+func (a flagAuditAdapter) RecordFlagChange(ctx context.Context, actor, name string, before, after *flags.Flag) error {
+	return a.logger.Log(ctx, service.AuditEntry{
+		Action:     "flag.change",
+		EntityType: "feature_flag",
+		OldValue:   before,
+		NewValue:   after,
+	})
 }
 
 func ledgerDomainConfig() ledger.ReconciliationConfig {
