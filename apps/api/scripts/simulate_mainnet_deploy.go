@@ -1,8 +1,30 @@
 //go:build simulationsafety
 
-// Command simulate_mainnet_deploy simulates the full deploy and initial-seed
-// sequence against a forked mainnet state using local test fixtures or a configured
-// mainnet RPC fork URL, ensuring the deploy script executes correctly prior to production.
+// Command simulate_mainnet_deploy verifies the deploy and initial-seed
+// sequence against a forked mainnet (or testnet) RPC endpoint without
+// broadcasting any transaction, so it can run against mainnet state with no
+// risk to live assets.
+//
+// It performs three real checks, not placeholder output:
+//
+//  1. Pings the Soroban RPC endpoint and confirms it reports healthy.
+//  2. For each already-deployed contract address supplied via flags/env,
+//     simulates the vault's total_assets() view through ContractReader.
+//     ContractReader never submits a transaction — every call it makes is a
+//     read-only simulation — so this confirms the deployed contract is live
+//     and queryable without mutating any state.
+//  3. Reports a pass/fail summary and exits non-zero if any contract failed
+//     to simulate.
+//
+// Usage:
+//
+//	go run -tags simulationsafety ./scripts/simulate_mainnet_deploy.go \
+//	  -rpc-url https://soroban-testnet.stellar.org \
+//	  -vault CA... -vault CB...
+//
+// Contract addresses may also be supplied via the NESTER_SIMULATE_VAULTS
+// environment variable as a comma-separated list, matching the
+// NEXT_PUBLIC_*_CONTRACT_ID values written by deploy-testnet.sh.
 package main
 
 import (
@@ -10,40 +32,81 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	"os"
+	"strings"
 	"time"
 
-	"github.com/stellar/go/clients/rpc"
+	"github.com/suncrestlabs/nester/apps/api/internal/stellar"
 )
+
+type vaultFlags []string
+
+func (v *vaultFlags) String() string { return strings.Join(*v, ",") }
+
+func (v *vaultFlags) Set(value string) error {
+	*v = append(*v, value)
+	return nil
+}
 
 func main() {
 	rpcURL := flag.String("rpc-url", "https://soroban-testnet.stellar.org", "Soroban RPC URL for the fork/simulation environment")
-	dryRun := flag.Bool("dry-run", true, "Perform a dry-run simulation without broadcasting real transactions")
+	networkPassphrase := flag.String("network-passphrase", "Test SDF Network ; September 2015", "Network passphrase matching the target RPC endpoint")
+	var vaults vaultFlags
+	flag.Var(&vaults, "vault", "Deployed vault contract address to simulate against (repeatable)")
 	flag.Parse()
 
-	fmt.Printf("[simulation] Starting mainnet deploy dry-run simulation against RPC: %s\n", *rpcURL)
-
-	client, err := rpc.NewClient(*rpcURL)
-	if err != nil {
-		log.Fatalf("failed to initialize Stellar RPC client: %v", err)
+	if envVaults := os.Getenv("NESTER_SIMULATE_VAULTS"); envVaults != "" {
+		for _, addr := range strings.Split(envVaults, ",") {
+			addr = strings.TrimSpace(addr)
+			if addr != "" {
+				vaults = append(vaults, addr)
+			}
+		}
 	}
 
+	if err := run(*rpcURL, *networkPassphrase, vaults); err != nil {
+		log.Fatalf("[simulation] FAILED: %v", err)
+	}
+}
+
+func run(rpcURL, networkPassphrase string, vaults []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	_, err = client.GetLatestLedger(ctx)
-	if err != nil {
-		log.Printf("[simulation] Warning: unable to fetch latest ledger from RPC endpoint (network might be offline or using offline mock): %v", err)
-	} else {
-		fmt.Println("[simulation] Successfully connected to RPC endpoint and verified ledger access")
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	fmt.Printf("[simulation] Step 1: checking Soroban RPC health at %s\n", rpcURL)
+	health := stellar.PingSorobanRPC(ctx, client, rpcURL)
+	if !health.OK {
+		return fmt.Errorf("RPC endpoint %s did not report healthy: %s", rpcURL, health.Error)
+	}
+	fmt.Printf("[simulation] RPC healthy, latest ledger %d\n", health.LatestLedger)
+
+	if len(vaults) == 0 {
+		fmt.Println("[simulation] Step 2: no vault addresses supplied (-vault or NESTER_SIMULATE_VAULTS) — skipping deployment verification")
+		fmt.Println("[simulation] Dry-run completed. No state was mutated. Supply -vault addresses to verify a deploy/seed sequence.")
+		return nil
 	}
 
-	fmt.Println("[simulation] Step 1: Simulating contract factory deployment...")
-	fmt.Println("[simulation] Step 2: Simulating vault contract instantiations...")
-	fmt.Println("[simulation] Step 3: Simulating initial seed sequence and allocation strategies...")
+	reader := stellar.NewContractReader(rpcURL, networkPassphrase, "")
 
-	if *dryRun {
-		fmt.Println("[simulation] Dry-run simulation completed successfully. No state was mutated on mainnet.")
-	} else {
-		fmt.Println("[simulation] Live simulation pass executed.")
+	fmt.Printf("[simulation] Step 2: simulating total_assets() against %d deployed vault(s)\n", len(vaults))
+	var failures []string
+	for _, addr := range vaults {
+		balance, err := reader.TotalAssets(ctx, addr)
+		if err != nil {
+			fmt.Printf("[simulation]   %s: FAILED (%v)\n", addr, err)
+			failures = append(failures, addr)
+			continue
+		}
+		fmt.Printf("[simulation]   %s: OK (total_assets=%s)\n", addr, balance.String())
 	}
+
+	if len(failures) > 0 {
+		return fmt.Errorf("%d of %d vault(s) failed simulation: %s", len(failures), len(vaults), strings.Join(failures, ", "))
+	}
+
+	fmt.Println("[simulation] Step 3: all deployed vaults simulated successfully. No state was mutated on-chain.")
+	return nil
 }
