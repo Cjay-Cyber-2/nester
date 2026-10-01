@@ -17,9 +17,15 @@ type OutflowBreakerConfig struct {
 	Window           time.Duration   // e.g., 1 * time.Hour
 }
 
+// DefaultOutflowBreakerConfig returns the breaker's default policy. Enabled
+// defaults to false: the breaker is new behaviour that can halt withdrawals
+// on legitimate large or whole-balance redemptions (nester#1377), so it must
+// be explicitly turned on by an operator (WITHDRAWAL_BREAKER_ENABLED, or
+// VaultService.SetOutflowBreakerConfig) rather than silently changing the
+// behaviour of every existing deployment and test the moment this ships.
 func DefaultOutflowBreakerConfig() OutflowBreakerConfig {
 	return OutflowBreakerConfig{
-		Enabled:          true,
+		Enabled:          false,
 		ThresholdPercent: decimal.NewFromInt(25),
 		Window:           1 * time.Hour,
 	}

@@ -153,6 +153,12 @@ type VaultService struct {
 	// built without one (tests, tooling) behaves as it did before the switch
 	// existed. Production wires it in SetMoneyPathSwitches.
 	moneyPathSwitches MoneyPathGate
+	// outflowBreakerConfig is the withdrawal circuit breaker's policy
+	// (nester#1377). Nil means "use vault.DefaultOutflowBreakerConfig()", so
+	// a service built without an override (tests, tooling) behaves exactly
+	// as before configurability existed. Production wires an override in
+	// SetOutflowBreakerConfig when the operator has set non-default values.
+	outflowBreakerConfig *vault.OutflowBreakerConfig
 }
 
 // MoneyPathGate reports whether a money-path operation may proceed. Declared
@@ -298,6 +304,23 @@ type VerifiedVaultEvent struct {
 // withdrawals from a confirmed transaction hash rather than the request body.
 func (s *VaultService) SetChainEventVerifier(verifier ChainEventVerifier) {
 	s.chainVerifier = verifier
+}
+
+// SetOutflowBreakerConfig overrides the withdrawal circuit breaker's
+// threshold and window (nester#1377). Passing the zero value disables the
+// breaker (Enabled defaults to false), matching how every other optional
+// policy on this service turns off cleanly with its zero value.
+func (s *VaultService) SetOutflowBreakerConfig(cfg vault.OutflowBreakerConfig) {
+	s.outflowBreakerConfig = &cfg
+}
+
+// outflowBreaker returns the configured breaker policy, falling back to
+// vault.DefaultOutflowBreakerConfig() when no override was set.
+func (s *VaultService) outflowBreaker() vault.OutflowBreakerConfig {
+	if s.outflowBreakerConfig != nil {
+		return *s.outflowBreakerConfig
+	}
+	return vault.DefaultOutflowBreakerConfig()
 }
 
 // SetMetrics wires the SLI recorder for the deposit and withdrawal service
@@ -713,7 +736,7 @@ func (s *VaultService) RecordWithdrawal(ctx context.Context, input RecordWithdra
 		return vault.Vault{}, err
 	}
 
-	breakerConfig := vault.DefaultOutflowBreakerConfig()
+	breakerConfig := s.outflowBreaker()
 	if breakerConfig.Enabled {
 		transactions, err := s.repository.ListUserVaultTransactions(ctx, existing.UserID, input.VaultID)
 		if err != nil {

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
@@ -13,8 +14,16 @@ func TestWithdrawalCircuitBreakerHaltsVault(t *testing.T) {
 	userID := uuid.New()
 	repo := newMemoryVaultRepository(userID)
 	svc := NewVaultService(repo)
+	// The breaker defaults to disabled (nester#1377); turn it on explicitly
+	// for this test rather than relying on the zero-config default.
+	svc.SetOutflowBreakerConfig(vault.OutflowBreakerConfig{
+		Enabled:          true,
+		ThresholdPercent: decimal.NewFromInt(25),
+		Window:           time.Hour,
+	})
 	svc.SetChainEventVerifier(&fakeChainVerifier{events: map[string]VerifiedVaultEvent{
-		"hash-1": {Amount: decimal.RequireFromString("30"), EventType: "withdraw", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+		"hash-deposit": {Amount: decimal.RequireFromString("100"), EventType: "deposit", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+		"hash-1":       {Amount: decimal.RequireFromString("30"), EventType: "withdraw", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
 	}})
 
 	created, err := svc.CreateVault(context.Background(), CreateVaultInput{
@@ -25,7 +34,7 @@ func TestWithdrawalCircuitBreakerHaltsVault(t *testing.T) {
 	}
 
 	_, err = svc.RecordDeposit(context.Background(), RecordDepositInput{
-		VaultID: created.ID, Amount: decimal.RequireFromString("100"),
+		VaultID: created.ID, Amount: decimal.RequireFromString("100"), TxHash: "hash-deposit",
 	})
 	if err != nil {
 		t.Fatalf("RecordDeposit: %v", err)
