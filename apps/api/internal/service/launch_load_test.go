@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
@@ -13,22 +14,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/jobqueue"
-	"github.com/suncrestlabs/nester/apps/api/internal/domain/vault"
 )
-
-const (
-	StatusPending   = "pending"
-	StatusRunning   = "running"
-	StatusCompleted = "completed"
-	StatusFailed    = "failed"
-)
-
-type QueueStats struct {
-	Pending   int
-	Running   int
-	Completed int
-	Failed    int
-}
 
 // Launch-day load test for the API money path and job queue (issue #1137).
 //
@@ -65,10 +51,15 @@ func newMemRepo() *memJobRepo {
 	}
 }
 
-func (m *memJobRepo) Enqueue(ctx context.Context, input jobqueue.EnqueueInput) (uuid.UUID, bool, error) {
+func (m *memJobRepo) Enqueue(_ context.Context, input jobqueue.EnqueueInput) (jobqueue.Job, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	id := uuid.New()
+	maxAttempts := input.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = jobqueue.DefaultMaxAttempts
+	}
+	now := time.Now()
 	j := jobqueue.Job{
 		ID:             id,
 		Type:           input.Type,
@@ -76,90 +67,157 @@ func (m *memJobRepo) Enqueue(ctx context.Context, input jobqueue.EnqueueInput) (
 		Status:         jobqueue.StatusPending,
 		Priority:       input.Priority,
 		IdempotencyKey: input.IdempotencyKey,
-		CreatedAt:      time.Now(),
-		MaxAttempts:    3,
+		NextRunAt:      input.RunAt,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		MaxAttempts:    maxAttempts,
+	}
+	if j.NextRunAt.IsZero() {
+		j.NextRunAt = now
 	}
 	m.jobs[id] = j
 	m.order = append(m.order, id)
-	return id, true, nil
+	return j, true, nil
 }
 
-func (m *memJobRepo) AcquireNext(ctx context.Context, workerID string, leaseDuration time.Duration, now time.Now) (*jobqueue.Job, error) {
+func (m *memJobRepo) Dequeue(_ context.Context, params jobqueue.DequeueParams) ([]jobqueue.Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	jobs := make([]jobqueue.Job, 0, params.Limit)
 	for _, id := range m.order {
+		if len(jobs) >= params.Limit {
+			break
+		}
 		j := m.jobs[id]
-		if j.Status == jobqueue.StatusPending {
+		if j.Type == params.Type && j.Status == jobqueue.StatusPending && !j.NextRunAt.After(params.Now) {
 			j.Status = jobqueue.StatusRunning
-			j.LockedBy = &workerID
-			exp := now.Add(leaseDuration)
-			j.LockedUntil = &exp
+			exp := params.Now.Add(params.Lease)
+			j.LeasedUntil = &exp
 			j.Attempts++
+			j.UpdatedAt = params.Now
 			m.jobs[id] = j
-			return &j, nil
+			jobs = append(jobs, j)
 		}
 	}
-	return nil, nil
+	return jobs, nil
 }
 
-func (m *memJobRepo) Heartbeat(ctx context.Context, jobID uuid.UUID, workerID string, leaseDuration time.Duration, now time.Now) (bool, error) {
+func (m *memJobRepo) Complete(_ context.Context, jobID uuid.UUID, result json.RawMessage) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	j, ok := m.jobs[jobID]
-	if !ok || j.Status != jobqueue.StatusRunning {
-		return false, nil
+	if !ok {
+		return jobqueue.ErrNotFound
 	}
-	exp := now.Add(leaseDuration)
-	j.LockedUntil = &exp
+	j.Status = jobqueue.StatusSucceeded
+	j.Result = result
+	j.UpdatedAt = time.Now()
 	m.jobs[jobID] = j
-	return true, nil
-}
-
-func (m *memJobRepo) Complete(ctx context.Context, jobID uuid.UUID, workerID string, now time.Now) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	j, ok := m.jobs[jobID]
-	if ok {
-		j.Status = jobqueue.StatusCompleted
-		j.CompletedAt = &now
-		m.jobs[jobID] = j
-	}
 	return nil
 }
 
-func (m *memJobRepo) Fail(ctx context.Context, jobID uuid.UUID, workerID string, errStr string, backoff time.Duration, now time.Now) error {
+func (m *memJobRepo) Retry(_ context.Context, jobID uuid.UUID, nextRunAt time.Time, lastErr string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	j, ok := m.jobs[jobID]
-	if ok {
-		if j.Attempts >= j.MaxAttempts {
-			j.Status = jobqueue.StatusFailed
-		} else {
-			j.Status = jobqueue.StatusPending
-		}
-		j.LastError = &errStr
-		m.jobs[jobID] = j
+	if !ok {
+		return jobqueue.ErrNotFound
 	}
+	j.Status = jobqueue.StatusPending
+	j.NextRunAt = nextRunAt
+	j.LastError = lastErr
+	j.UpdatedAt = time.Now()
+	m.jobs[jobID] = j
 	return nil
 }
 
-func (m *memJobRepo) Stats(ctx context.Context, now time.Now) (QueueStats, error) {
+func (m *memJobRepo) DeadLetter(_ context.Context, jobID uuid.UUID, lastErr string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var stats QueueStats
+	j, ok := m.jobs[jobID]
+	if !ok {
+		return jobqueue.ErrNotFound
+	}
+	j.Status = jobqueue.StatusDead
+	j.LastError = lastErr
+	j.UpdatedAt = time.Now()
+	m.jobs[jobID] = j
+	return nil
+}
+
+func (m *memJobRepo) Heartbeat(_ context.Context, jobID uuid.UUID, leasedUntil time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[jobID]
+	if !ok {
+		return jobqueue.ErrNotFound
+	}
+	j.LeasedUntil = &leasedUntil
+	j.UpdatedAt = time.Now()
+	m.jobs[jobID] = j
+	return nil
+}
+
+func (m *memJobRepo) Stats(_ context.Context, _ time.Time) (jobqueue.Stats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var stats jobqueue.Stats
 	for _, j := range m.jobs {
 		switch j.Status {
 		case jobqueue.StatusPending:
-			stats.Pending++
+			stats.Depth++
 		case jobqueue.StatusRunning:
 			stats.Running++
-		case jobqueue.StatusCompleted:
-			stats.Completed++
-		case jobqueue.StatusFailed:
-			stats.Failed++
+		case jobqueue.StatusDead:
+			stats.DeadLetter++
 		}
 	}
 	return stats, nil
+}
+
+func (m *memJobRepo) GetByID(_ context.Context, id uuid.UUID) (jobqueue.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.jobs[id]
+	if !ok {
+		return jobqueue.Job{}, jobqueue.ErrNotFound
+	}
+	return job, nil
+}
+
+func (m *memJobRepo) ListDead(_ context.Context, limit, offset int) ([]jobqueue.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	dead := make([]jobqueue.Job, 0)
+	for _, id := range m.order {
+		if m.jobs[id].Status == jobqueue.StatusDead {
+			dead = append(dead, m.jobs[id])
+		}
+	}
+	if offset >= len(dead) {
+		return []jobqueue.Job{}, nil
+	}
+	dead = dead[offset:]
+	if limit > 0 && limit < len(dead) {
+		dead = dead[:limit]
+	}
+	return dead, nil
+}
+
+func (m *memJobRepo) ManualRetry(_ context.Context, id uuid.UUID, runAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.jobs[id]
+	if !ok || job.Status != jobqueue.StatusDead {
+		return jobqueue.ErrNotFound
+	}
+	job.Status = jobqueue.StatusPending
+	job.Attempts = 0
+	job.NextRunAt = runAt
+	job.LastError = ""
+	job.UpdatedAt = time.Now()
+	m.jobs[id] = job
+	return nil
 }
 
 func TestLaunchDayAPIAndJobQueueLoad(t *testing.T) {
@@ -316,7 +374,7 @@ func TestLaunchDayAPIAndJobQueueLoad(t *testing.T) {
 			return false
 		}
 		return stats.Running == 0 && queueSuccess.Load() >= int64(queueJobsCount)
-	})
+	}, func() string { return "launch job queue drained" })
 
 	sok := succeeded.Load()
 	sbad := failed.Load()
@@ -363,7 +421,7 @@ func TestLaunchDayAPIAndJobQueueLoad(t *testing.T) {
 	withdrawalsCount := int64(opsPerUser) / 2
 	wantBalance := seedBalance.
 		Add(depositAmount.Mul(decimal.NewFromInt(depositsCount))).
-		sub(withdrawAmount.Mul(decimal.NewFromInt(withdrawalsCount)))
+		Sub(withdrawAmount.Mul(decimal.NewFromInt(withdrawalsCount)))
 
 	for i, vID := range vaultIDs {
 		finalVault, err := svc.GetVault(ctx, vID)
