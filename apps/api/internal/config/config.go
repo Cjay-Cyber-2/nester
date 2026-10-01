@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 
 	"github.com/suncrestlabs/nester/apps/api/internal/breaker"
@@ -57,6 +58,7 @@ type Config struct {
 	jobQueue             JobQueueConfig
 	outbox               OutboxConfig
 	harvest              HarvestConfig
+	canary               CanaryConfig
 	rebalancer           RebalancerConfig
 	schedulerLeadership  SchedulerLeadershipConfig
 	tracing              TracingConfig
@@ -490,6 +492,16 @@ func Load() (*Config, error) {
 			window:   loader.durationDefault("HARVEST_ENGINE_WINDOW", time.Hour),
 			margin:   loader.stringDefault("HARVEST_ENGINE_MARGIN", "0.10"),
 			gasFee:   loader.stringDefault("HARVEST_ENGINE_GAS_FEE", "0.05"),
+		},
+		canary: CanaryConfig{
+			// Defaults to disabled: the canary moves real funds on a real
+			// schedule, so an operator must explicitly opt in and configure
+			// a dedicated canary vault via CANARY_VAULT_ID.
+			enabled:          loader.boolDefault("CANARY_ENABLED", false),
+			interval:         loader.durationDefault("CANARY_INTERVAL", 5*time.Minute),
+			vaultID:          loader.uuidDefault("CANARY_VAULT_ID", uuid.Nil),
+			amount:           loader.stringDefault("CANARY_AMOUNT", "0.01"),
+			latencyThreshold: loader.durationDefault("CANARY_LATENCY_THRESHOLD", 60*time.Second),
 		},
 		jobQueue: JobQueueConfig{
 			enabled:            loader.boolDefault("JOB_QUEUE_ENABLED", true),
@@ -926,6 +938,25 @@ func (h HarvestConfig) Interval() time.Duration { return h.interval }
 func (h HarvestConfig) Window() time.Duration   { return h.window }
 func (h HarvestConfig) Margin() string          { return h.margin }
 func (h HarvestConfig) GasFee() string          { return h.gasFee }
+
+// CanaryConfig governs the synthetic mainnet deposit/withdraw probe
+// (nester#1390). Disabled by default — operators must explicitly set
+// CANARY_ENABLED=true and configure a dedicated canary vault before the
+// probe will run.
+type CanaryConfig struct {
+	enabled          bool
+	interval         time.Duration
+	vaultID          uuid.UUID
+	amount           string
+	latencyThreshold time.Duration
+}
+
+func (c Config) Canary() CanaryConfig                { return c.canary }
+func (n CanaryConfig) Enabled() bool                 { return n.enabled }
+func (n CanaryConfig) Interval() time.Duration       { return n.interval }
+func (n CanaryConfig) VaultID() uuid.UUID            { return n.vaultID }
+func (n CanaryConfig) Amount() string                { return n.amount }
+func (n CanaryConfig) LatencyThreshold() time.Duration { return n.latencyThreshold }
 
 // RebalancerConfig governs the automated vault rebalance-decision loop
 // (nester#372; wired into main.go as part of #846). Money-moving: gated
@@ -1578,6 +1609,19 @@ func (l *envLoader) stringDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func (l *envLoader) uuidDefault(key string, fallback uuid.UUID) uuid.UUID {
+	raw, ok := l.lookup(key)
+	if !ok || raw == "" {
+		return fallback
+	}
+	value, err := uuid.Parse(raw)
+	if err != nil {
+		l.addError(key + " must be a valid UUID")
+		return fallback
+	}
+	return value
 }
 
 func (l *envLoader) intDefault(key string, fallback int) int {

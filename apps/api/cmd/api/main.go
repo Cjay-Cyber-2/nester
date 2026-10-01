@@ -1284,6 +1284,31 @@ func run() error {
 	defer cancelDataRetention()
 	go dataRetentionJob.Run(dataRetentionCtx, 24*time.Hour)
 
+	// Synthetic mainnet deposit/withdraw canary (#1390): probes a dedicated
+	// canary vault on a fixed schedule so an alert fires before users report
+	// problems. Disabled by default (CANARY_ENABLED) since it moves real
+	// funds; the invoker below is a stub that logs and errors rather than
+	// touching the chain — wiring a real on-chain probe implementation is
+	// tracked as a mainnet-launch follow-up, but the scheduled-job
+	// infrastructure runs end to end so enabling it is a config flip once
+	// that invoker lands.
+	canaryJob := scheduler.NewCanaryJob(
+		scheduler.CanaryConfig{
+			Enabled:          cfg.Canary().Enabled(),
+			Interval:         cfg.Canary().Interval(),
+			VaultID:          cfg.Canary().VaultID(),
+			Amount:           cfg.Canary().Amount(),
+			LatencyThreshold: cfg.Canary().LatencyThreshold(),
+		},
+		stubCanaryInvoker{},
+		appMetrics,
+		baseLogger.WithGroup("canary"),
+	)
+	canaryJob.SetLeaderChecker(schedulerLeadership)
+	canaryCtx, cancelCanary := context.WithCancel(context.Background())
+	defer cancelCanary()
+	go canaryJob.Run(canaryCtx)
+
 	jobWorker := jobqueue.NewWorker(
 		jobQueueRepo,
 		jobqueue.Config{
@@ -2556,6 +2581,22 @@ func (a *reconciliationVaultListerAdapter) ListActiveForReconciliation(ctx conte
 		})
 	}
 	return out, nil
+}
+
+// stubCanaryInvoker is a placeholder scheduler.CanaryInvoker. It keeps the
+// canary job's scheduling/leader-election/metrics infrastructure running
+// end to end without touching the chain. It must be replaced with an
+// implementation that performs a real deposit/withdraw round trip against
+// the configured canary vault before CANARY_ENABLED is turned on for a
+// mainnet environment (nester#1390 follow-up).
+type stubCanaryInvoker struct{}
+
+func (stubCanaryInvoker) CanaryDeposit(ctx context.Context, vaultID uuid.UUID, amount string) (string, error) {
+	return "", fmt.Errorf("canary: no real invoker configured (stubCanaryInvoker); see nester#1390 follow-up")
+}
+
+func (stubCanaryInvoker) CanaryWithdraw(ctx context.Context, vaultID uuid.UUID, txHash string) (string, error) {
+	return "", fmt.Errorf("canary: no real invoker configured (stubCanaryInvoker); see nester#1390 follow-up")
 }
 
 func ledgerDomainConfig() ledger.ReconciliationConfig {
