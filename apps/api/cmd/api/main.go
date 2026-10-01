@@ -45,7 +45,6 @@ import (
 	"github.com/suncrestlabs/nester/apps/api/internal/repository/postgres"
 	"github.com/suncrestlabs/nester/apps/api/internal/retry"
 	"github.com/suncrestlabs/nester/apps/api/internal/scheduler"
-	apiserver "github.com/suncrestlabs/nester/apps/api/internal/server"
 	"github.com/suncrestlabs/nester/apps/api/internal/service"
 	performancesvc "github.com/suncrestlabs/nester/apps/api/internal/service/performance"
 	tvlsvc "github.com/suncrestlabs/nester/apps/api/internal/service/tvl"
@@ -378,11 +377,6 @@ func run() error {
 	// through this store before it is sent.
 	submissionStore := stellarpkg.NewPostgresSubmissionStore(db)
 
-	// Tracks every in-flight chain submission (deposit, withdraw, rebalance,
-	// harvest, and every other money-path write) so shutdown can drain them
-	// rather than abandon one mid-flight (nester#1112).
-	inFlightTracker := apiserver.NewInFlightTracker()
-
 	var chainInvoker service.VaultChainInvoker
 	switch {
 	case cfg.Stellar().SigningIsolated():
@@ -415,9 +409,6 @@ func run() error {
 		// persists an intent before it is sent, so a lost RPC response can
 		// never leave a transaction the system knows nothing about.
 		inv.SetSubmissionStore(submissionStore, baseLogger.WithGroup("chain-submission"))
-		// Graceful shutdown drains in-flight chain submissions (nester#1112)
-		// rather than abandoning one mid-flight.
-		inv.SetInFlightTracker(inFlightTracker)
 		chainInvoker = inv
 		vaultService.SetDepositInvoker(inv)
 		baseLogger.Info("signing is isolated: this process holds no operator key",
@@ -441,9 +432,6 @@ func run() error {
 		// persists an intent before it is sent, so a lost RPC response can
 		// never leave a transaction the system knows nothing about.
 		inv.SetSubmissionStore(submissionStore, baseLogger.WithGroup("chain-submission"))
-		// Graceful shutdown drains in-flight chain submissions (nester#1112)
-		// rather than abandoning one mid-flight.
-		inv.SetInFlightTracker(inFlightTracker)
 		chainInvoker = inv
 		vaultService.SetDepositInvoker(inv)
 		baseLogger.Warn("signing key is held in the API process; " +
@@ -1858,12 +1846,6 @@ func run() error {
 		baseLogger.Error("graceful shutdown timed out", "error", err.Error())
 		return err
 	}
-
-	// Drain in-flight money-path chain submissions before the process exits
-	// (nester#1112). server.Shutdown above has already stopped accepting new
-	// requests, so by this point the only in-flight work left is whatever
-	// chain submission was already underway.
-	inFlightTracker.Wait(cfg.Server().GracefulShutdown(), baseLogger.WithGroup("shutdown"))
 
 	// Stopped after the public server so that a scrape during the drain
 	// still reports the in-flight requests being drained. A failure to shut
