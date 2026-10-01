@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -1783,6 +1784,33 @@ func run() error {
 		baseLogger.Error("failed to register balance reconcile age collector", "error", err)
 	}
 	go balanceReconciler.Run(shutdownCtx)
+
+	// Stellar operational account reserve monitoring (nester#1392): poll the
+	// operator's native XLM balance from Horizon on a fixed interval and
+	// expose it as a scrape-time series (freshness-collector pattern) so
+	// monitoring/alerts/stellar_reserve.yml can page before the account runs
+	// dry of the reserve it needs for trustlines/sponsorships.
+	if operatorAddress := cfg.Stellar().OperatorAddress(); operatorAddress != "" {
+		safeReserveXLM := 5.0
+		if v := os.Getenv("STELLAR_OPERATIONAL_ACCOUNT_SAFE_RESERVE_XLM"); v != "" {
+			if parsed, err := strconv.ParseFloat(v, 64); err == nil && parsed > 0 {
+				safeReserveXLM = parsed
+			}
+		}
+		reserveMonitor := stellarpkg.NewAccountReserveSampler(
+			&http.Client{Timeout: 10 * time.Second},
+			cfg.Stellar().HorizonURL(),
+			operatorAddress,
+			safeReserveXLM,
+			baseLogger.WithGroup("stellar-reserve-monitor"),
+		)
+		if err := appMetrics.RegisterStellarAccountReserve("operator", reserveMonitor.Sample); err != nil {
+			baseLogger.Error("failed to register stellar account reserve collector", "error", err)
+		}
+		go reserveMonitor.Run(shutdownCtx, time.Minute)
+	} else {
+		baseLogger.Warn("STELLAR_OPERATOR_ADDRESS unset: stellar account reserve monitoring disabled")
+	}
 
 	// Balance-freshness SLI (nester#1056, nester#1088): the indexer samples
 	// its own position against the network tip on every tick and publishes it

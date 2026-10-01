@@ -1,7 +1,6 @@
 package metrics
 
 import (
-
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -19,19 +18,19 @@ type stellarReserveCollector struct {
 
 func newStellarReserveCollector(accountName string, source StellarAccountBalanceSource) *stellarReserveCollector {
 	return &stellarReserveCollector{
-	source:      source,
-	accountName: accountName,
-	balance: prometheus.NewDesc(
-		prometheus.BuildFQName(Namespace, "stellar", "account_balance_xlm"),
-		"Current XLM balance of the operational Stellar account.",
-		[]string{"account_name"}, nil,
-	),
-	reserve: prometheus.NewDesc(
-		prometheus.BuildFQName(Namespace, "stellar", "account_safe_reserve_xlm"),
-		"Safe XLM reserve threshold for the operational Stellar account.",
-		[]string{"account_name"}, nil,
-	),
-}
+		source:      source,
+		accountName: accountName,
+		balance: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, "stellar", "account_balance_xlm"),
+			"Current XLM balance of the operational Stellar account.",
+			[]string{"account_name"}, nil,
+		),
+		reserve: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, "stellar", "account_safe_reserve_xlm"),
+			"Safe XLM reserve threshold for the operational Stellar account.",
+			[]string{"account_name"}, nil,
+		),
+	}
 }
 
 func (c *stellarReserveCollector) Describe(ch chan<- *prometheus.Desc) {
