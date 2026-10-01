@@ -538,7 +538,7 @@ jobs:
         run: go vet ./...
 
       - name: Install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@v0.5.1
+        run: go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
 
       - name: staticcheck
         run: staticcheck ./...
