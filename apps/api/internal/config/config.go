@@ -302,6 +302,13 @@ type StellarConfig struct {
 	operatorFundedDepositVaults string
 	// operatorFundedDepositMaxAmount caps a single operator-funded deposit.
 	operatorFundedDepositMaxAmount string
+	// mainnetVaultTVLCap is the hard ceiling on a single vault's total value
+	// locked, enforced only when networkPassphrase is the mainnet passphrase
+	// (nester#1376). Empty or non-positive means no cap. Kept as a single
+	// deployment-wide ceiling, separate from the per-vault soft_capacity
+	// column, since the goal is a blanket safety limit on mainnet exposure
+	// while it is unproven rather than a per-vault business limit.
+	mainnetVaultTVLCap string
 	// withdrawalBreakerEnabled turns the withdrawal circuit breaker
 	// (nester#1377) on or off. Defaults to off, matching
 	// vault.DefaultOutflowBreakerConfig(): it is new behaviour that can halt
@@ -414,6 +421,7 @@ func Load() (*Config, error) {
 			allocationStrategyAddress:         loader.stringDefault("STELLAR_ALLOCATION_STRATEGY_ADDRESS", ""),
 			withdrawalSlippageBps:             loader.intDefault("WITHDRAWAL_SLIPPAGE_BPS", 50),
 			harvestDefaultCompound:            loader.boolDefault("HARVEST_DEFAULT_COMPOUND", true),
+			mainnetVaultTVLCap:                loader.stringDefault("STELLAR_MAINNET_VAULT_TVL_CAP", "0"),
 			withdrawalBreakerEnabled:          loader.boolDefault("WITHDRAWAL_BREAKER_ENABLED", false),
 			withdrawalBreakerThresholdPercent: loader.stringDefault("WITHDRAWAL_BREAKER_THRESHOLD_PERCENT", "25"),
 			withdrawalBreakerWindow:           loader.durationDefault("WITHDRAWAL_BREAKER_WINDOW", time.Hour),
@@ -1526,6 +1534,13 @@ func (s StellarConfig) OperatorFundedDepositVaults() string {
 // OperatorFundedDepositMaxAmount caps a single operator-funded deposit.
 func (s StellarConfig) OperatorFundedDepositMaxAmount() string {
 	return s.operatorFundedDepositMaxAmount
+}
+
+// MainnetVaultTVLCap returns the configured hard ceiling on a single vault's
+// total value locked, enforced only on mainnet (nester#1376). Empty or
+// non-positive means no cap.
+func (s StellarConfig) MainnetVaultTVLCap() string {
+	return s.mainnetVaultTVLCap
 }
 
 // WithdrawalBreakerEnabled reports whether the withdrawal circuit breaker

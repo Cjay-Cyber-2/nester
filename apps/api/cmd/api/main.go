@@ -305,6 +305,14 @@ func run() error {
 	// Deposit and withdrawal SLIs (nester#1056).
 	vaultService.SetMetrics(appMetrics)
 	vaultService.SetHarvestDefaultCompound(cfg.Stellar().HarvestDefaultCompound())
+	// Mainnet-only hard TVL cap per vault (nester#1376): never enforced off
+	// mainnet, and only enforced on mainnet when a positive cap is configured.
+	isMainnet := cfg.Stellar().NetworkPassphrase() == "Public Global Stellar Network ; September 2015"
+	tvlCap, err := decimal.NewFromString(cfg.Stellar().MainnetVaultTVLCap())
+	if err != nil {
+		return fmt.Errorf("parse STELLAR_MAINNET_VAULT_TVL_CAP: %w", err)
+	}
+	vaultService.SetTVLCapManager(service.NewMainnetTVLCapManager(isMainnet, tvlCap))
 	// Withdrawal circuit breaker (nester#1377): configurable threshold and
 	// window instead of the hardcoded default.
 	breakerThreshold, err := decimal.NewFromString(cfg.Stellar().WithdrawalBreakerThresholdPercent())
