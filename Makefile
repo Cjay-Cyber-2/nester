@@ -31,6 +31,15 @@ go-test-short:
 clean:
 	cd $(CONTRACTS_DIR) && $(CARGO) clean
 
+db-backup:
+	@bash scripts/db-backup.sh
+
+db-restore:
+	@bash scripts/db-restore.sh $(FILE)
+
+db-restore-drill:
+	@bash scripts/db-restore-drill.sh
+
 # Docker Compose — local development
 #
 # By default, all services bind to 127.0.0.1 (loopback only) for security.
