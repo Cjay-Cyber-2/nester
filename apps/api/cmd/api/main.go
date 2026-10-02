@@ -33,6 +33,7 @@ import (
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/outbox"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/transaction"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/usersignal"
+	"github.com/suncrestlabs/nester/apps/api/internal/domain/vault"
 	"github.com/suncrestlabs/nester/apps/api/internal/freshness"
 	"github.com/suncrestlabs/nester/apps/api/internal/handler"
 	"github.com/suncrestlabs/nester/apps/api/internal/harvest"
@@ -304,6 +305,17 @@ func run() error {
 	// Deposit and withdrawal SLIs (nester#1056).
 	vaultService.SetMetrics(appMetrics)
 	vaultService.SetHarvestDefaultCompound(cfg.Stellar().HarvestDefaultCompound())
+	// Withdrawal circuit breaker (nester#1377): configurable threshold and
+	// window instead of the hardcoded default.
+	breakerThreshold, err := decimal.NewFromString(cfg.Stellar().WithdrawalBreakerThresholdPercent())
+	if err != nil {
+		return fmt.Errorf("parse WITHDRAWAL_BREAKER_THRESHOLD_PERCENT: %w", err)
+	}
+	vaultService.SetOutflowBreakerConfig(vault.OutflowBreakerConfig{
+		Enabled:          cfg.Stellar().WithdrawalBreakerEnabled(),
+		ThresholdPercent: breakerThreshold,
+		Window:           cfg.Stellar().WithdrawalBreakerWindow(),
+	})
 	vaultHandler := handler.NewVaultHandler(vaultService)
 
 	yieldHarvestRepository := postgres.NewYieldHarvestRepository(db)
