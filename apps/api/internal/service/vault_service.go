@@ -159,6 +159,12 @@ type VaultService struct {
 	// built without one (tests, tooling, testnet) behaves as it did before
 	// the cap existed. Production wires it in SetTVLCapManager.
 	tvlCapManager caps.VaultTVLCapManager
+	// outflowBreakerConfig is the withdrawal circuit breaker's policy
+	// (nester#1377). Nil means "use vault.DefaultOutflowBreakerConfig()", so
+	// a service built without an override (tests, tooling) behaves exactly
+	// as before configurability existed. Production wires an override in
+	// SetOutflowBreakerConfig when the operator has set non-default values.
+	outflowBreakerConfig *vault.OutflowBreakerConfig
 }
 
 // MoneyPathGate reports whether a money-path operation may proceed. Declared
@@ -310,6 +316,23 @@ func (s *VaultService) SetChainEventVerifier(verifier ChainEventVerifier) {
 // (nester#1376). A nil manager (the default) enforces nothing.
 func (s *VaultService) SetTVLCapManager(manager caps.VaultTVLCapManager) {
 	s.tvlCapManager = manager
+}
+
+// SetOutflowBreakerConfig overrides the withdrawal circuit breaker's
+// threshold and window (nester#1377). Passing the zero value disables the
+// breaker (Enabled defaults to false), matching how every other optional
+// policy on this service turns off cleanly with its zero value.
+func (s *VaultService) SetOutflowBreakerConfig(cfg vault.OutflowBreakerConfig) {
+	s.outflowBreakerConfig = &cfg
+}
+
+// outflowBreaker returns the configured breaker policy, falling back to
+// vault.DefaultOutflowBreakerConfig() when no override was set.
+func (s *VaultService) outflowBreaker() vault.OutflowBreakerConfig {
+	if s.outflowBreakerConfig != nil {
+		return *s.outflowBreakerConfig
+	}
+	return vault.DefaultOutflowBreakerConfig()
 }
 
 // SetMetrics wires the SLI recorder for the deposit and withdrawal service
@@ -734,6 +757,28 @@ func (s *VaultService) RecordWithdrawal(ctx context.Context, input RecordWithdra
 	existing, err := s.repository.GetVault(ctx, input.VaultID)
 	if err != nil {
 		return vault.Vault{}, err
+	}
+
+	breakerConfig := s.outflowBreaker()
+	if breakerConfig.Enabled {
+		transactions, err := s.repository.ListUserVaultTransactions(ctx, existing.UserID, input.VaultID)
+		if err != nil {
+			return vault.Vault{}, err
+		}
+		cutoff := time.Now().Add(-breakerConfig.Window)
+		sumOutflows := input.Amount
+		for _, transaction := range transactions {
+			if transaction.Type == "withdrawal" && !transaction.CreatedAt.Before(cutoff) {
+				sumOutflows = sumOutflows.Add(transaction.Amount)
+			}
+		}
+		if existing.CurrentBalance.IsPositive() {
+			pct := sumOutflows.Div(existing.CurrentBalance).Mul(decimal.NewFromInt(100))
+			if pct.GreaterThanOrEqual(breakerConfig.ThresholdPercent) {
+				_ = s.repository.UpdateVault(ctx, input.VaultID, existing.ContractAddress, vault.StatusPaused)
+				return vault.Vault{}, vault.ErrVaultPausedByBreaker
+			}
+		}
 	}
 
 	if existing.Status == vault.StatusClosed {

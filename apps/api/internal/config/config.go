@@ -87,7 +87,7 @@ type CircuitBreakerConfig struct {
 	openDuration time.Duration
 
 	sorobanRPCOverride breakerOverride
-	horizonOverride     breakerOverride
+	horizonOverride    breakerOverride
 }
 
 // breakerOverride holds per-upstream threshold overrides. A nil pointer field
@@ -295,6 +295,17 @@ type StellarConfig struct {
 	// column, since the goal is a blanket safety limit on mainnet exposure
 	// while it is unproven rather than a per-vault business limit.
 	mainnetVaultTVLCap string
+	// withdrawalBreakerEnabled turns the withdrawal circuit breaker
+	// (nester#1377) on or off. Defaults to off, matching
+	// vault.DefaultOutflowBreakerConfig(): it is new behaviour that can halt
+	// legitimate large withdrawals, so an operator opts in explicitly.
+	withdrawalBreakerEnabled bool
+	// withdrawalBreakerThresholdPercent is the rolling-window outflow
+	// percentage of a vault's TVL that halts it. e.g. 25 for 25%.
+	withdrawalBreakerThresholdPercent string
+	// withdrawalBreakerWindow is the rolling window the breaker sums
+	// outflows over, e.g. "1h".
+	withdrawalBreakerWindow time.Duration
 }
 
 type AllocationConfig struct {
@@ -382,21 +393,24 @@ func Load() (*Config, error) {
 			connectionTimeout: loader.durationDefault("DATABASE_CONNECTION_TIMEOUT", 5*time.Second),
 		},
 		stellar: StellarConfig{
-			networkPassphrase:              loader.requiredString("STELLAR_NETWORK_PASSPHRASE"),
-			rpcURL:                         loader.requiredURL("STELLAR_RPC_URL"),
-			horizonURL:                     loader.requiredURL("STELLAR_HORIZON_URL"),
-			operatorSecret:                 loader.stringDefault("STELLAR_OPERATOR_SECRET", ""),
-			operatorFundedDepositsEnabled:  loader.boolDefault("STELLAR_OPERATOR_FUNDED_DEPOSITS_ENABLED", false),
-			operatorFundedDepositVaults:    loader.stringDefault("STELLAR_OPERATOR_FUNDED_DEPOSIT_VAULTS", ""),
-			operatorFundedDepositMaxAmount: loader.stringDefault("STELLAR_OPERATOR_FUNDED_DEPOSIT_MAX_AMOUNT", "0"),
-			operatorAddress:                loader.stringDefault("STELLAR_OPERATOR_ADDRESS", ""),
-			signerSocketPath:               loader.stringDefault("SIGNER_SOCKET_PATH", ""),
-			stellarUSDCIssuer:              loader.stringDefault("STELLAR_USDC_ISSUER", "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"),
-			yieldRegistryContract:          loader.stringDefault("YIELD_REGISTRY_CONTRACT", ""),
-			allocationStrategyAddress:      loader.stringDefault("STELLAR_ALLOCATION_STRATEGY_ADDRESS", ""),
-			withdrawalSlippageBps:          loader.intDefault("WITHDRAWAL_SLIPPAGE_BPS", 50),
-			harvestDefaultCompound:         loader.boolDefault("HARVEST_DEFAULT_COMPOUND", true),
-			mainnetVaultTVLCap:             loader.stringDefault("STELLAR_MAINNET_VAULT_TVL_CAP", "0"),
+			networkPassphrase:                 loader.requiredString("STELLAR_NETWORK_PASSPHRASE"),
+			rpcURL:                            loader.requiredURL("STELLAR_RPC_URL"),
+			horizonURL:                        loader.requiredURL("STELLAR_HORIZON_URL"),
+			operatorSecret:                    loader.stringDefault("STELLAR_OPERATOR_SECRET", ""),
+			operatorFundedDepositsEnabled:     loader.boolDefault("STELLAR_OPERATOR_FUNDED_DEPOSITS_ENABLED", false),
+			operatorFundedDepositVaults:       loader.stringDefault("STELLAR_OPERATOR_FUNDED_DEPOSIT_VAULTS", ""),
+			operatorFundedDepositMaxAmount:    loader.stringDefault("STELLAR_OPERATOR_FUNDED_DEPOSIT_MAX_AMOUNT", "0"),
+			operatorAddress:                   loader.stringDefault("STELLAR_OPERATOR_ADDRESS", ""),
+			signerSocketPath:                  loader.stringDefault("SIGNER_SOCKET_PATH", ""),
+			stellarUSDCIssuer:                 loader.stringDefault("STELLAR_USDC_ISSUER", "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"),
+			yieldRegistryContract:             loader.stringDefault("YIELD_REGISTRY_CONTRACT", ""),
+			allocationStrategyAddress:         loader.stringDefault("STELLAR_ALLOCATION_STRATEGY_ADDRESS", ""),
+			withdrawalSlippageBps:             loader.intDefault("WITHDRAWAL_SLIPPAGE_BPS", 50),
+			harvestDefaultCompound:            loader.boolDefault("HARVEST_DEFAULT_COMPOUND", true),
+			mainnetVaultTVLCap:                loader.stringDefault("STELLAR_MAINNET_VAULT_TVL_CAP", "0"),
+			withdrawalBreakerEnabled:          loader.boolDefault("WITHDRAWAL_BREAKER_ENABLED", false),
+			withdrawalBreakerThresholdPercent: loader.stringDefault("WITHDRAWAL_BREAKER_THRESHOLD_PERCENT", "25"),
+			withdrawalBreakerWindow:           loader.durationDefault("WITHDRAWAL_BREAKER_WINDOW", time.Hour),
 		},
 
 		allocation: AllocationConfig{
@@ -1400,6 +1414,24 @@ func (s StellarConfig) OperatorFundedDepositMaxAmount() string {
 // non-positive means no cap.
 func (s StellarConfig) MainnetVaultTVLCap() string {
 	return s.mainnetVaultTVLCap
+}
+
+// WithdrawalBreakerEnabled reports whether the withdrawal circuit breaker
+// (nester#1377) is on.
+func (s StellarConfig) WithdrawalBreakerEnabled() bool {
+	return s.withdrawalBreakerEnabled
+}
+
+// WithdrawalBreakerThresholdPercent is the rolling-window outflow
+// percentage of a vault's TVL that halts it, as a decimal string.
+func (s StellarConfig) WithdrawalBreakerThresholdPercent() string {
+	return s.withdrawalBreakerThresholdPercent
+}
+
+// WithdrawalBreakerWindow is the rolling window the breaker sums outflows
+// over.
+func (s StellarConfig) WithdrawalBreakerWindow() time.Duration {
+	return s.withdrawalBreakerWindow
 }
 
 // OperatorAddress returns the operator's public Stellar address. It is public

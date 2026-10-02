@@ -33,6 +33,7 @@ import (
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/outbox"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/transaction"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/usersignal"
+	"github.com/suncrestlabs/nester/apps/api/internal/domain/vault"
 	"github.com/suncrestlabs/nester/apps/api/internal/freshness"
 	"github.com/suncrestlabs/nester/apps/api/internal/handler"
 	"github.com/suncrestlabs/nester/apps/api/internal/harvest"
@@ -312,6 +313,17 @@ func run() error {
 		return fmt.Errorf("parse STELLAR_MAINNET_VAULT_TVL_CAP: %w", err)
 	}
 	vaultService.SetTVLCapManager(service.NewMainnetTVLCapManager(isMainnet, tvlCap))
+	// Withdrawal circuit breaker (nester#1377): configurable threshold and
+	// window instead of the hardcoded default.
+	breakerThreshold, err := decimal.NewFromString(cfg.Stellar().WithdrawalBreakerThresholdPercent())
+	if err != nil {
+		return fmt.Errorf("parse WITHDRAWAL_BREAKER_THRESHOLD_PERCENT: %w", err)
+	}
+	vaultService.SetOutflowBreakerConfig(vault.OutflowBreakerConfig{
+		Enabled:          cfg.Stellar().WithdrawalBreakerEnabled(),
+		ThresholdPercent: breakerThreshold,
+		Window:           cfg.Stellar().WithdrawalBreakerWindow(),
+	})
 	vaultHandler := handler.NewVaultHandler(vaultService)
 
 	yieldHarvestRepository := postgres.NewYieldHarvestRepository(db)
@@ -2567,9 +2579,5 @@ func (a *reconciliationVaultListerAdapter) ListActiveForReconciliation(ctx conte
 }
 
 func ledgerDomainConfig() ledger.ReconciliationConfig {
-	return ledger.ReconciliationConfig{
-		Enabled:          true,
-		Interval:         5 * time.Minute,
-		ToleranceStroops: 1_000_000, // 0.1 USDC
-	}
+	return scheduler.LedgerReconciliationConfigFromEnv(true, 5*time.Minute, 1_000_000) // 0.1 USDC tolerance
 }
