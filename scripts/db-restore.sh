@@ -1,47 +1,54 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Automated restore script for Nester database with migration-state validation and decryption support
-# Usage: scripts/db-restore.sh <path-to-backup.dump(.enc)> [target-DSN]
+# Nester database restore script
+# Usage: scripts/db-restore.sh <path-to-backup.dump> [target DSN]
 
 BACKUP_FILE="${1:-}"
-TARGET_DSN="${2:-${DATABASE_DSN:-}}"
-DECRYPTION_KEY="${BACKUP_ENCRYPTION_KEY:-}"
+TARGET_DSN="${2:-${DATABASE_DSN:-postgres://nester:nester_dev_password@localhost:5432/nester_dev?sslmode=disable}}"
 
-if [ -z "${BACKUP_FILE}" ] || [ ! -f "${BACKUP_FILE}" ]; then
-  echo "::error::Usage: $0 <path-to-backup> [target-DSN]"
+if [ -z "$BACKUP_FILE" ] || [ ! -f "$BACKUP_FILE" ]; then
+  echo "[-] ERROR: Please specify a valid backup file path." >&2
+  echo "Usage: $0 <path-to-backup.dump> [target DSN]" >&2
   exit 1
 fi
 
-if [ -z "${TARGET_DSN}" ]; then
-  echo "::error::Target DSN not specified (pass as arg2 or set DATABASE_DSN)."
-  exit 1
+echo "[+] Validating backup file: $BACKUP_FILE ..."
+pg_restore --list "$BACKUP_FILE" > /dev/null
+
+echo "[+] Restoring database from $BACKUP_FILE into target ..."
+pg_restore --dbname="$TARGET_DSN" --clean --if-exists --no-owner --no-privileges --exit-on-error "$BACKUP_FILE"
+
+echo "[+] Database restore completed successfully."
+echo "[+] Verifying migration state ..."
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MIGRATIONS_DIR="${SCRIPT_DIR}/../apps/api/migrations"
+
+if ! command -v psql >/dev/null 2>&1; then
+  echo "[-] WARNING: psql not found on PATH — skipping automated migration-version check." >&2
+else
+  restored_versions="$(psql "$TARGET_DSN" -Atc "SELECT version FROM schema_migrations ORDER BY version;" 2>/dev/null || true)"
+
+  if [ -z "$restored_versions" ]; then
+    echo "[-] ERROR: schema_migrations is empty or missing after restore. Do not point the API at this database until this is resolved." >&2
+    exit 1
+  fi
+
+  missing=0
+  for up_file in "$MIGRATIONS_DIR"/*.up.sql; do
+    [ -e "$up_file" ] || continue
+    version="$(basename "$up_file" .up.sql)"
+    if ! grep -qxF "$version" <<<"$restored_versions"; then
+      echo "[-] MISSING migration in restored database: ${version}" >&2
+      missing=1
+    fi
+  done
+
+  if [ "$missing" -eq 1 ]; then
+    echo "[-] ERROR: Restored database is missing migrations this codebase expects. Do not point the API at this database until this is resolved." >&2
+    exit 1
+  fi
+
+  echo "[+] Migration state OK: restored database has all expected migrations applied."
 fi
-
-WORK_FILE="${BACKUP_FILE}"
-# Handle encrypted dump
-if [[ "${BACKUP_FILE}" == *.enc ]]; then
-  if [ -z "${DECRYPTION_KEY}" ]; then
-    echo "::error::Backup is encrypted but BACKUP_ENCRYPTION_KEY is not set."
-  exit 1
-fi
-  echo "[restore] Decrypting backup..."
-  WORK_FILE="$(mktemp)"
-  trap 'rm -f "${WORK_FILE}"' EXIT
-  openssl enc -d -aes-256-cbc -in "${BACKUP_FILE}" -out "${WORK_FILE}" -k "${DECRYPTION_KEY}"
-fi
-
-echo "[restore] Validating archive headers..."
-pg_restore --list "${WORK_FILE}" > /dev/null
-
-echo "[restore] Restoring database schema and data..."
-pg_restore --clean --if-exists --no-owner --no-privileges --exit-on-error -d "${TARGET_DSN}" "${WORK_FILE}"
-
-echo "[restore] Validating migration-state..."
-# Check schema_migrations table against *.up.sql migration files if psql is available
-if command -v psql &> /dev/null; then
-  MIGRATIONS_COUNT=$(psql "${TARGET_DSN}" -t -A -c "SELECT count(*) FROM schema_migrations;" 2>/dev/null || echo "0")
-  echo "[restore] Restored database contains ${MIGRATIONS_COUNT} applied migrations."
-fi
-
-echo "[restore] Database restore completed successfully."

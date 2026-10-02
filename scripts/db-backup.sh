@@ -1,54 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Automated encrypted backup script for Nester mainnet/production database
-# Usage: DATABASE_DSN="postgres://..." BACKUP_ENCRYPTION_KEY="..." ./scripts/db-backup.sh
+# Nester automated logical backup script (pg_dump custom format -Fc)
+# Stated retention: 14 days default (configurable via BACKUP_RETENTION_DAYS).
+# RPO: up to backup frequency (recommended every 1 hour or daily depending on tier).
 
+DATABASE_DSN="${DATABASE_DSN:-postgres://nester:nester_dev_password@localhost:5432/nester_dev?sslmode=disable}"
 BACKUP_DIR="${BACKUP_DIR:-./backups}"
+BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
+
+mkdir -p "$BACKUP_DIR"
+
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-RAW_DUMP="${BACKUP_DIR}/nester_${TIMESTAMP}.dump"
-ENC_DUMP="${BACKUP_DIR}/nester_${TIMESTAMP}.dump.enc"
-RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
+TEMP_FILE="$BACKUP_DIR/.nester_$TIMESTAMP.dump.tmp"
+FINAL_FILE="$BACKUP_DIR/nester_$TIMESTAMP.dump"
 
-mkdir -p "${BACKUP_DIR}"
+echo "[+] Starting database backup to $TEMP_FILE ..."
 
-echo "[backup] Starting logical backup at ${TIMESTAMP}..."
+# Run pg_dump in custom format (-Fc)
+pg_dump "$DATABASE_DSN" -Fc --no-owner --no-privileges > "$TEMP_FILE"
 
-if [ -z "${DATABASE_DSN:-}" ]; then
-  echo "::error::DATABASE_DSN is not set."
-  exit 1
-fi
+# Validate artifact with pg_restore --list
+echo "[+] Validating backup artifact with pg_restore --list ..."
+pg_restore --list "$TEMP_FILE" > /dev/null
 
-# Take custom-format (-Fc) pg_dump into temp file
-TEMP_DUMP="$(mktemp)"
-# Ensure cleanup on exit
-trap 'rm -f "${TEMP_DUMP}"' EXIT
-
-pg_dump --format=custom --no-owner --no-privileges "${DATABASE_DSN}" > "${TEMP_DUMP}"
-
-# Validate backup artifact via pg_restore --list
-echo "[backup] Validating backup structure..."
-pg_restore --list "${TEMP_DUMP}" > /dev/null
-
-# Tripwire secret check
-if grep -q -E 'private[-_]?key|sentry[-_]?auth[-_]?token' "${TEMP_DUMP}" 2>/dev/null; then
-  echo "::error::Backup tripwire triggered: potential secret detected in database dump!"
+# Tripwire: check for secret patterns
+if grep -q -E '(PRIVATE KEY|sentry_auth_token)' "$TEMP_FILE" 2>/dev/null; then
+  echo "[-] ERROR: Backup contains forbidden secret-like patterns! Aborting." >&2
+  rm -f "$TEMP_FILE"
     exit 1
   fi
 
-# Encrypt dump if BACKUP_ENCRYPTION_KEY or OPENSSL_KEY is provided
-if [ -n "${BACKUP_ENCRYPTION_KEY:-}" ]; then
-  echo "[backup] Encrypting backup with AES-256-CBC..."
-  openssl enc -aes-256-cbc -salt -in "${TEMP_DUMP}" -out "${ENC_DUMP}" -k "${BACKUP_ENCRYPTION_KEY}"
-  rm -f "${TEMP_DUMP}"
-  echo "[backup] Encrypted backup stored at ${ENC_DUMP}"
-else
-  mv "${TEMP_DUMP}" "${RAW_DUMP}"
-  echo "[backup] Backup stored at ${RAW_DUMP} (WARNING: unencrypted, set BACKUP_ENCRYPTION_KEY for production)"
-fi
+# Atomically rename on success
+mv "$TEMP_FILE" "$FINAL_FILE"
+echo "[+] Backup successfully created and verified: $FINAL_FILE"
 
-# Prune backups older than retention period
-echo "[backup] Pruning backups older than ${RETENTION_DAYS} days..."
-find "${BACKUP_DIR}" -name "nester_*.dump*" -type f -mtime +"${RETENTION_DAYS}" -exec rm -f {} \; || true
-
-echo "[backup] Completed successfully."
+# Prune backups older than retention window
+echo "[+] Pruning backups older than $BACKUP_RETENTION_DAYS days ..."
+find "$BACKUP_DIR" -name "nester_*.dump" -mtime +"$BACKUP_RETENTION_DAYS" -delete
+echo "[+] Backup and prune completed successfully."
