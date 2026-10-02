@@ -112,9 +112,9 @@ func main() {
 // passphrase is never echoed into the log.
 func stellarNetworkLabel(passphrase string) string {
 	switch passphrase {
-	case "Public Global Stellar Network ; September 2015":
+	case config.StellarMainnetPassphrase:
 		return "pubnet"
-	case "Test SDF Network ; September 2015":
+	case config.StellarTestnetPassphrase:
 		return "testnet"
 	case "Test SDF Future Network ; October 2022":
 		return "futurenet"

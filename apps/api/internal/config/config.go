@@ -25,6 +25,18 @@ import (
 // in source is what makes the check possible (nester#1035, G101).
 const defaultDevJWTSecret = "dev-nester-jwt-secret-change-in-production" // #nosec G101 -- known-bad placeholder that startup validation refuses, not a real secret
 
+// Stellar network passphrase constants (nester#1396). Named here so every
+// comparison in validation uses the same string rather than duplicating the
+// literal, and so a grep for the constant finds every assertion site.
+const (
+	// StellarMainnetPassphrase is the canonical passphrase for the Stellar
+	// public (mainnet) network.
+	StellarMainnetPassphrase = "Public Global Stellar Network ; September 2015"
+	// StellarTestnetPassphrase is the canonical passphrase for the Stellar
+	// testnet (SDF-operated).
+	StellarTestnetPassphrase = "Test SDF Network ; September 2015"
+)
+
 // maxKeyVersionLen bounds an account cipher key version label so it fits the
 // bank_accounts.key_version VARCHAR(32) column.
 const maxKeyVersionLen = 32
@@ -1322,6 +1334,8 @@ func (c *Config) validate(loader *envLoader) {
 		loader.addError("WITHDRAWAL_SLIPPAGE_BPS must be between 1 and 300")
 	}
 
+	validateStellarNetworkConsistency(c.stellar, loader)
+
 	if c.allocation.minWeightPercent < 1 || c.allocation.minWeightPercent > 100 {
 		loader.addError("MIN_ALLOCATION_WEIGHT must be between 1 and 100")
 	}
@@ -1348,6 +1362,88 @@ func validateAllowedOrigins(environment string, origins []string, loader *envLoa
 		}
 		if parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 			loader.addError(fmt.Sprintf("ALLOWED_ORIGINS entry %q must not contain a path, query, or fragment", origin))
+		}
+	}
+}
+
+// validateStellarNetworkConsistency asserts that the configured network
+// passphrase is consistent with the RPC and Horizon URLs, and that the
+// contract addresses are not left at their testnet defaults when the
+// passphrase indicates mainnet (nester#1396).
+//
+// The goal is to prevent the API from routing a mainnet-authenticated request
+// against testnet contracts or vice versa. A misconfigured deployment that
+// mixes environments can silently credit wrong amounts or target wrong
+// contracts; catching it at startup prevents both the data corruption and the
+// user-visible financial harm.
+//
+// URL heuristic: SDF's canonical hosts contain "testnet" or "futurenet" in
+// the hostname for testnet infrastructure and do not contain them for mainnet.
+// This is a best-effort check against the most common misconfiguration; a
+// custom node whose hostname does not follow SDF conventions (e.g. a private
+// network) is classified as "custom" and skipped, since the operator has
+// explicitly diverged from the standard naming.
+func validateStellarNetworkConsistency(s StellarConfig, loader *envLoader) {
+	passphrase := strings.TrimSpace(s.networkPassphrase)
+	if passphrase == "" {
+		// requiredString already recorded this error; do not pile on.
+		return
+	}
+
+	rpcURL := strings.ToLower(s.rpcURL)
+	horizonURL := strings.ToLower(s.horizonURL)
+
+	rpcIsTestnet := strings.Contains(rpcURL, "testnet") || strings.Contains(rpcURL, "futurenet")
+	horizonIsTestnet := strings.Contains(horizonURL, "testnet") || strings.Contains(horizonURL, "futurenet")
+
+	switch passphrase {
+	case StellarMainnetPassphrase:
+		if rpcIsTestnet {
+			loader.addError(
+				"STELLAR_RPC_URL appears to be a testnet endpoint but STELLAR_NETWORK_PASSPHRASE is set to mainnet; " +
+					"set both to the same network to prevent cross-environment routing",
+			)
+		}
+		if horizonIsTestnet {
+			loader.addError(
+				"STELLAR_HORIZON_URL appears to be a testnet endpoint but STELLAR_NETWORK_PASSPHRASE is set to mainnet; " +
+					"set both to the same network to prevent cross-environment routing",
+			)
+		}
+		// Contract addresses must be present on mainnet: a blank address would
+		// silently call address "" on-chain or skip the contract entirely, which
+		// is wrong in every mainnet scenario.
+		if strings.TrimSpace(s.yieldRegistryContract) == "" {
+			loader.addError(
+				"YIELD_REGISTRY_CONTRACT must be set when STELLAR_NETWORK_PASSPHRASE is the mainnet passphrase",
+			)
+		}
+		if strings.TrimSpace(s.allocationStrategyAddress) == "" {
+			loader.addError(
+				"STELLAR_ALLOCATION_STRATEGY_ADDRESS must be set when STELLAR_NETWORK_PASSPHRASE is the mainnet passphrase",
+			)
+		}
+
+	case StellarTestnetPassphrase:
+		// A testnet passphrase pointed at mainnet URLs is equally dangerous:
+		// testnet keys cannot sign mainnet transactions, but a bug that
+		// confused them could still leak information or charge fees on the
+		// wrong network.
+		rpcIsMainnetSDF := strings.Contains(rpcURL, "horizon.stellar.org") ||
+			(strings.Contains(rpcURL, "stellar.org") && !rpcIsTestnet)
+		horizonIsMainnetSDF := strings.Contains(horizonURL, "horizon.stellar.org") ||
+			(strings.Contains(horizonURL, "stellar.org") && !horizonIsTestnet)
+		if rpcIsMainnetSDF {
+			loader.addError(
+				"STELLAR_RPC_URL appears to be a mainnet endpoint but STELLAR_NETWORK_PASSPHRASE is set to testnet; " +
+					"set both to the same network to prevent cross-environment routing",
+			)
+		}
+		if horizonIsMainnetSDF {
+			loader.addError(
+				"STELLAR_HORIZON_URL appears to be a mainnet endpoint but STELLAR_NETWORK_PASSPHRASE is set to testnet; " +
+					"set both to the same network to prevent cross-environment routing",
+			)
 		}
 	}
 }
@@ -1482,6 +1578,20 @@ func (s StellarConfig) WithdrawalSlippageBps() int {
 
 func (s StellarConfig) HarvestDefaultCompound() bool {
 	return s.harvestDefaultCompound
+}
+
+// NetworkEnv classifies the configured network passphrase into a stable label
+// (nester#1396). Callers use this to decide whether they are running against
+// mainnet or testnet without comparing the raw passphrase string.
+func (s StellarConfig) NetworkEnv() string {
+	switch strings.TrimSpace(s.networkPassphrase) {
+	case StellarMainnetPassphrase:
+		return "mainnet"
+	case StellarTestnetPassphrase:
+		return "testnet"
+	default:
+		return "custom"
+	}
 }
 
 func (a AllocationConfig) MinWeightPercent() int {
