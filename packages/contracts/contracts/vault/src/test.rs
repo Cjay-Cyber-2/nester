@@ -279,6 +279,33 @@ fn reinitialize_is_rejected() {
     vault.initialize(&admin, &second_token, &second_vault_token, &treasury);
 }
 
+#[test]
+fn deposit_allowlist_gate_rejects_uninvited_users_and_allows_invited_users() {
+    let (env, admin, token, vault, _treasury) = setup();
+    let invited = Address::generate(&env);
+    let uninvited = Address::generate(&env);
+    let amount = 100 * XLM;
+    mint(&token, &invited, amount);
+    mint(&token, &uninvited, amount);
+
+    vault.set_deposit_allowlist_enabled(&admin, &true);
+    assert!(vault.try_deposit(&uninvited, &amount, &0).is_err());
+
+    vault.set_deposit_allowlisted(&admin, &invited, &true);
+    assert!(vault.try_deposit(&invited, &amount, &0).is_ok());
+}
+
+#[test]
+fn deposit_allowlist_is_disabled_by_default() {
+    let (env, _admin, token, vault, _treasury) = setup();
+    let user = Address::generate(&env);
+    let amount = 100 * XLM;
+    mint(&token, &user, amount);
+
+    assert!(!vault.deposit_allowlist_enabled());
+    assert!(vault.try_deposit(&user, &amount, &0).is_ok());
+}
+
 // ---------------------------------------------------------------------------
 // Deposit — share accounting
 // ---------------------------------------------------------------------------
